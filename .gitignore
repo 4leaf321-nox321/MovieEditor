@@ -1,0 +1,11 @@
+.venv/
+tools/ffmpeg/
+models/
+voices/
+작업/
+__pycache__/
+settings.ini
+error.log
+build/
+dist/
+NVIDIA Corporation/

@@ -1,0 +1,4 @@
+* text=auto
+# cmd.exe misreads batch files with LF line endings; they are also CP949, not UTF-8.
+*.bat text eol=crlf working-tree-encoding=CP949
+*.ico binary
