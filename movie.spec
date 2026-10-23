@@ -13,11 +13,15 @@ datas = [(ICON, "assets")]
 datas += [(f"tts_app/melo/g2pk/{pattern}", "tts_app/melo/g2pk") for pattern in ("*.txt", "*.csv", "LICENSE")]
 datas += collect_data_files("jamo")
 binaries, hiddenimports = [], []
-for package in ("mecab", "mecab_ko_dic", "mcp", "mcp_types"):
+for package in ("mecab", "mecab_ko_dic", "mcp_types"):
     d, b, h = collect_all(package)
     datas += d
     binaries += b
     hiddenimports += h
+# The MCP SDK, without its command-line tool (needs typer, and quits when imported without it) and the v1 name
+# that only raises an error.
+hiddenimports += collect_submodules("mcp", filter=lambda name: not name.startswith(("mcp.cli", "mcp.__main__", "mcp.server.fastmcp")))
+datas += collect_data_files("mcp")
 # Loaded by name at run time: anyio's event loop backend, and Pillow, which puts thumbnails in Excel files.
 hiddenimports += collect_submodules("anyio._backends") + ["PIL.Image", "PIL.PngImagePlugin"]
 

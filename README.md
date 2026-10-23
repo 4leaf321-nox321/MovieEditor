@@ -16,7 +16,7 @@
   1. `dist\동영상편집기.zip`을 다른 PC로 옮겨 원하는 곳에 풉니다(바탕화면, 문서 폴더 등).
   2. 폴더 안의 `동영상편집기.exe`를 더블클릭합니다.
   - 설정·작업 파일은 exe 옆에 저장됩니다. `Program Files`처럼 쓸 수 없는 곳에 두면 `%LOCALAPPDATA%\동영상편집기`에 저장됩니다.
-  - 같은 폴더의 `movie-cli.exe`(합성), `tts-cli.exe`(음성 만들기)는 명령줄 도구입니다. 아래 "명령줄"에서 `.venv\Scripts\python cli.py` 대신 `movie-cli.exe`, `tts_cli.py` 대신 `tts-cli.exe`를 쓰면 됩니다.
+  - 같은 폴더의 `movie-cli.exe`(합성), `tts-cli.exe`(음성 만들기)는 명령줄 도구이고, `movie-mcp.exe`는 Claude에 연결하는 MCP 서버입니다(아래 "Claude에서 쓰기"). 아래 "명령줄"에서 `.venv\Scripts\python cli.py` 대신 `movie-cli.exe`, `tts_cli.py` 대신 `tts-cli.exe`를 쓰면 됩니다.
   - 인터넷에서 받은 zip이면 처음 실행할 때 "Windows의 PC 보호" 창이 뜰 수 있습니다(서명하지 않은 프로그램). **추가 정보 → 실행**을 누르세요.
   - "DLL을 불러올 수 없다"는 오류가 나면 Microsoft Visual C++ 재배포 패키지를 설치하세요.
 - **다른 PC (소스 그대로)**: [Python 3.12](https://www.python.org/downloads/)를 설치(**Add python.exe to PATH** 체크)한 뒤, 이 폴더를 복사하고 `setup.bat`을 실행합니다.
@@ -234,7 +234,7 @@ Claude는 보통 이 순서로 도구를 씁니다.
 - 장면 캐시는 편집기와 따로(`작업\장면캐시_MCP`) 써서, 편집기를 켜 둔 채 같이 써도 서로 방해하지 않습니다. 그래픽 카드 인코딩은 편집기의 설정을 따릅니다.
 - **연결 설정**: Claude Code는 사용자 설정(`%USERPROFILE%\.claude.json`, 모든 폴더에서 쓰임)에, Claude Desktop은 `%APPDATA%\Claude\claude_desktop_config.json`에 `movie-editor`로 들어 있습니다. 둘 다 이 PC의 `.venv\Scripts\python.exe mcp_server.py`를 실행합니다. Claude Desktop은 설정을 바꾼 뒤 트레이에서 완전히 종료하고 다시 켜야 불러옵니다.
   - 다시 등록: `claude mcp add --scope user movie-editor -- "<폴더>\.venv\Scripts\python.exe" "<폴더>\mcp_server.py"` / 빼기: `claude mcp remove movie-editor -s user`
-  - exe 버전에는 아직 들어 있지 않습니다(이 PC의 소스 버전으로 실행).
+  - **exe 버전**은 같은 폴더의 `movie-mcp.exe`가 MCP 서버입니다: `claude mcp add --scope user movie-editor -- "<exe 폴더>\movie-mcp.exe"`, Claude Desktop 설정에는 `"command": "<exe 폴더>\movie-mcp.exe"`(args 없음)로 넣습니다. 프로그램을 쓰지 않을 때도 Claude가 알아서 켜고 끕니다.
 
 ## 명령줄
 
