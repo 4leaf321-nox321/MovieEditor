@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from movie_app import autosave
+
 from . import paths, pipeline, subtitles, textproc
 from .editor import TextEditor, format_length
 from .engine import MAX_SPEED, MELO_VOICE, MIN_SPEED, Engine, list_voices
@@ -192,6 +194,14 @@ class TtsPage(QWidget):
 
         self._build_ui()
         self._restore()
+        self.script_path = autosave.session().file(WORK_DIR / "대본.txt")
+        self._restore_script()
+        # The script is saved shortly after every change, so closing or a crash never loses it.
+        self.script_timer = QTimer(self)
+        self.script_timer.setSingleShot(True)
+        self.script_timer.setInterval(1500)
+        self.script_timer.timeout.connect(self._save_script)
+        self.editor.textChanged.connect(self.script_timer.start)
 
         self.count_timer = QTimer(self)
         self.count_timer.setSingleShot(True)
@@ -583,6 +593,29 @@ class TtsPage(QWidget):
         self.srt_line.setValue(int(s.value("srt_line", 30)))
         self.srt_line.setEnabled(self.srt_check.isChecked())
 
+    def _restore_script(self) -> None:
+        """The script being worked on last time, as it was then."""
+        source = WORK_DIR / "대본.txt"
+        try:
+            text = source.read_text(encoding="utf-8") if source.exists() else ""
+        except OSError:
+            return
+        if text.strip() and not self.editor.toPlainText().strip():
+            self.editor.setPlainText(text)
+            self._backup_script()
+
+    def _backup_script(self) -> None:
+        try:
+            autosave.backup(self.editor.toPlainText(), "대본", ".txt")
+        except OSError:
+            _log_error(traceback.format_exc())  # a full disk must not stop the program from starting or closing
+
+    def _save_script(self) -> None:
+        try:
+            autosave.write(self.script_path, self.editor.toPlainText())
+        except OSError:
+            pass  # tried again on the next change and on closing
+
     def _save_store(self) -> None:
         s = self.store
         st = self.current_settings()
@@ -950,4 +983,7 @@ class TtsPage(QWidget):
             self.render_thread.cancel()
             self.render_thread.wait(10_000)
         self.player.stop()
+        self.script_timer.stop()
+        self._save_script()
+        self._backup_script()
         self._save_store()

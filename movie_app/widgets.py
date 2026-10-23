@@ -103,6 +103,10 @@ class Screen(QLabel):
         self._frame = QPixmap()
         self.setText(text)
 
+    def current_frame(self) -> QPixmap:
+        """The frame shown, at its own size (empty while a message is shown)."""
+        return self._frame
+
     def open_full_size(self) -> None:
         if not self._frame.isNull():
             viewer = FrameViewer(self._frame, self.window())

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProxyStyl
 from tts_app import paths as tts_paths
 from tts_app.gui import TtsPage
 
-from . import paths
+from . import autosave, paths
 from .compose_page import ComposePage
 from .scene_page import ScenePage
 from .widgets import APP_TITLE, log_error
@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
         self.tts_page.voiceReady.connect(self._use_voice)
         self.scene_page.videoReady.connect(self._use_video)
+        self.scene_page.subtitle_style = self.compose_page.current_style  # its preview shows the same subtitles
 
         geometry = self.store.value("geometry")
         if geometry:
@@ -109,8 +110,8 @@ class MainWindow(QMainWindow):
         self.compose_page.receive_voice(audio)
         self.scene_page.receive_voice(audio)
 
-    def _use_video(self, video: Path) -> None:
-        self.compose_page.receive_video(video)
+    def _use_video(self, handoff: dict) -> None:
+        self.compose_page.receive_video(handoff["video"], handoff)
         self.tabs.setCurrentWidget(self.compose_page)
 
     def closeEvent(self, event) -> None:
@@ -120,6 +121,7 @@ class MainWindow(QMainWindow):
                 page.shutdown()
             except Exception:  # noqa: BLE001 - logged; closing goes on
                 log_error(traceback.format_exc())
+        autosave.session().close()  # closed properly: the next start does not report a crash
         self.store.setValue("geometry", self.saveGeometry())
         self.store.setValue("tab", self.tabs.currentIndex())
         self.store.sync()

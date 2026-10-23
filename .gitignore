@@ -3,9 +3,13 @@ tools/ffmpeg/
 models/
 voices/
 작업/
+효과음/
 __pycache__/
 settings.ini
 error.log
 build/
 dist/
 NVIDIA Corporation/
+스타일/
+플러그인/
+템플릿/

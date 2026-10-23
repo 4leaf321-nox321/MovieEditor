@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import media, paths, render, subs
+from . import encoder, formats, media, paths, render, subs
 from .media import MediaInfo, format_time
 from .subs import SubStyle
 from .widgets import APP_TITLE, ColorButton, Screen, log_error, select
@@ -44,10 +44,15 @@ EXTENDS = [("freeze", "마지막 장면에서 멈춤"), ("loop", "처음부터 �
 QUALITIES = [("fast", "빠름"), ("standard", "표준"), ("high", "고품질")]
 SUBTITLE_MODES = [("burn", "영상에 입히기"), ("soft", "켜고 끄는 자막 (빠름)")]
 POSITIONS = [("bottom", "아래"), ("middle", "가운데"), ("top", "위")]
+HIGHLIGHTS = [("none", "없음"), ("fill", "읽는 만큼 색 채우기 (노래방)"), ("word", "지금 읽는 단어만")]
+EFFECTS = [("none", "없음"), ("fade", "서서히 나타남"), ("pop", "톡 튀어나옴"), ("slide", "아래에서 올라옴")]
+LOUDNESS_CHOICES = [("", "그대로"), ("youtube", "유튜브·SNS (-14 LUFS)"), ("podcast", "팟캐스트 (-16 LUFS)"),
+                    ("broadcast", "방송 (-24 LUFS)")]  # fmt: skip
 DEFAULT_JOB = render.Job(Path(), Path())
 DEFAULT_STYLE = SubStyle()
 # Job fields kept in settings.ini between runs (files are not remembered).
-JOB_KEYS = ("fit", "extend", "delay", "tail", "voice_volume", "original_volume", "subtitle_mode", "quality")
+JOB_KEYS = ("fit", "extend", "delay", "tail", "voice_volume", "original_volume", "subtitle_mode", "quality",
+            "music_volume", "music_duck", "music_fade", "fade_in", "fade_out", "loudness")  # fmt: skip
 
 
 def _filter(title: str, suffixes: tuple[str, ...]) -> str:
@@ -64,6 +69,7 @@ FILE_KINDS = {
         "[음성 만들기] 탭에서 보내면 자동으로 들어옵니다 · 같은 이름의 자막이 있으면 함께 불러옵니다",
     ),
     "subtitle": ("자막", [_filter("자막 파일", subs.SUBTITLE_SUFFIXES)], "SRT, ASS, VTT"),
+    "music": ("배경 음악", [_filter("음악 파일", media.AUDIO_SUFFIXES)], "영상 아래에 깔 음악 · 짧으면 반복합니다"),
 }
 
 
@@ -134,9 +140,13 @@ class ComposePage(QWidget):
         self.setAcceptDrops(True)
         self.store = QSettings(str(paths.DATA_DIR / "settings.ini"), QSettings.Format.IniFormat)
         self.store.beginGroup("compose")  # the other tabs keep their settings in the same file
+        self.shared = QSettings(str(paths.DATA_DIR / "settings.ini"), QSettings.Format.IniFormat)  # for all tabs
+        encoder.use_gpu = self.shared.value("gpu", encoder.use_gpu, type=bool)
         self.files: dict[str, Path | None] = dict.fromkeys(FILE_KINDS)
         self.video_info: MediaInfo | None = None
         self.audio_info: MediaInfo | None = None
+        self.music_info: MediaInfo | None = None
+        self.effects: list[tuple[Path, float, float]] = []  # sound effects put in on the video tab
         self.cues: list[subs.Cue] = []
         self.preview_thread: PreviewThread | None = None
         self.render_thread: RenderThread | None = None
@@ -147,6 +157,11 @@ class ComposePage(QWidget):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setInterval(250)
         self.preview_timer.timeout.connect(self._start_preview)
+        # Settings are written as they change, not only on closing, so a crash keeps them.
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(2000)
+        self.save_timer.timeout.connect(self._save_store)
 
         self._build_ui()
         self._restore()
@@ -238,9 +253,13 @@ class ComposePage(QWidget):
         full_btn = QPushButton("원본 크기로 보기")
         full_btn.setToolTip("이 장면을 확대 없이 실제 픽셀 그대로 봅니다 (미리보기를 두 번 클릭해도 됩니다)")
         full_btn.clicked.connect(self.screen.open_full_size)
+        save_btn = QPushButton("이미지로 저장…")
+        save_btn.setToolTip("이 장면을 자막까지 그대로, 원본 크기의 PNG·JPG로 저장합니다 (썸네일 만들기)")
+        save_btn.clicked.connect(self.save_frame)
         row.addWidget(self.position_slider, 1)
         row.addWidget(self.time_label)
         row.addWidget(full_btn)
+        row.addWidget(save_btn)
         layout.addLayout(row)
 
         self.preview_note = QLabel()
@@ -264,13 +283,43 @@ class ComposePage(QWidget):
         self.voice_slider = self._add_slider(grid, 4, "음성 볼륨", 0, 200, lambda v: f"{v}%")
         self.original_slider = self._add_slider(grid, 5, "원본 소리", 0, 100, lambda v: f"{v}%" if v else "끔")
         self.original_slider.setToolTip("영상에 원래 들어 있던 소리의 크기입니다. 0이면 뺍니다.")
-        self.quality_combo = self._add_combo(grid, 6, "화질", QUALITIES)
+        self.music_slider = self._add_slider(grid, 6, "음악 크기", 0, 100, lambda v: f"{v}%")
+        self.music_slider.setToolTip("배경 음악의 크기 (위 [파일]에서 배경 음악을 고르면 쓸 수 있습니다)")
+        self.duck_check = QCheckBox("목소리 나올 때 음악 줄이기")
+        self.duck_check.setToolTip("말하는 동안에는 음악이 작아지고, 쉬는 동안에는 다시 커집니다")
+        grid.addWidget(self.duck_check, 7, 1, 1, 2)
+        self.music_fade_spin = self._add_seconds(grid, 8, "음악 페이드", 10.0)
+        self.music_fade_spin.setSingleStep(0.5)
+        self.music_fade_spin.setToolTip("음악이 처음에 서서히 커지고 끝에 서서히 작아지는 시간")
+        self.fade_in_spin, self.fade_out_spin = self._fade_spin(), self._fade_spin()
+        self.fade_in_spin.setToolTip("영상이 검은 화면에서 서서히 밝아지고 소리도 서서히 커지는 시간 (0이면 없음)")
+        self.fade_out_spin.setToolTip("영상이 끝에서 서서히 어두워지고 소리도 서서히 작아지는 시간 (0이면 없음)")
+        grid.addWidget(QLabel("시작·끝 페이드"), 9, 0)
+        grid.addLayout(self._row(QLabel("시작"), self.fade_in_spin, QLabel("끝"), self.fade_out_spin), 9, 1, 1, 2)
+        self.loudness_combo = self._add_combo(grid, 10, "음량 맞추기", LOUDNESS_CHOICES)
+        self.loudness_combo.setToolTip(
+            "결과 소리의 크기를 기준에 맞춥니다. 소리를 한 번 미리 재기 때문에 조금 더 걸립니다.\n"
+            "유튜브·인스타그램 등은 -14 LUFS보다 크면 알아서 줄이므로, 맞춰 두면 다른 영상과 크기가 비슷해집니다."
+        )
+        self.effects_check = QCheckBox()
+        self.effects_check.setChecked(True)
+        self.effects_check.setToolTip("[② 영상 만들기]의 타임라인에 넣은 효과음을 정한 시각에 넣습니다")
+        self.effects_label = QLabel("효과음")
+        grid.addWidget(self.effects_label, 11, 0)
+        grid.addWidget(self.effects_check, 11, 1, 1, 2)
+        self.quality_combo = self._add_combo(grid, 12, "화질", QUALITIES)
         self.quality_combo.setToolTip("고품질은 파일이 조금 커지고 만드는 데 시간이 더 걸립니다")
+        self.gpu_check = QCheckBox("그래픽 카드로 인코딩")
+        self.gpu_check.setToolTip("그래픽 카드의 인코더로 만듭니다. 큰 영상에서 더 빠르고 파일은 조금 커집니다.\n"
+                                  "[② 영상 만들기] 탭에도 같이 적용됩니다.")  # fmt: skip
+        self.gpu_check.setChecked(encoder.use_gpu)
+        self.gpu_check.toggled.connect(self._gpu_toggled)
+        grid.addWidget(self.gpu_check, 13, 1, 1, 2)
 
         self.summary_label = QLabel()
         self.summary_label.setObjectName("muted")
         self.summary_label.setWordWrap(True)
-        grid.addWidget(self.summary_label, 7, 0, 1, 3)
+        grid.addWidget(self.summary_label, 14, 0, 1, 3)
         return box
 
     def _build_subtitle_box(self) -> QGroupBox:
@@ -329,13 +378,28 @@ class ComposePage(QWidget):
         grid.addWidget(QLabel("위치"), 5, 0)
         grid.addLayout(self._row(self.position_combo, QLabel("여백"), self.margin_spin), 5, 1, 1, 2)
 
+        self.highlight_combo = QComboBox()
+        for code, label in HIGHLIGHTS:
+            self.highlight_combo.addItem(label, code)
+        self.highlight_combo.setToolTip("말하는 단어를 강조합니다. 단어마다의 시간은 글자 수로 나눠 짐작합니다.")
+        self.highlight_color_btn = ColorButton("강조 색")
+        grid.addWidget(QLabel("단어 강조"), 6, 0)
+        grid.addLayout(self._row(self.highlight_combo, self.highlight_color_btn), 6, 1, 1, 2)
+        self.effect_combo = QComboBox()
+        for code, label in EFFECTS:
+            self.effect_combo.addItem(label, code)
+        self.effect_combo.setToolTip("자막이 나타날 때의 효과 (미리보기 그림에는 다 나타난 모습이 나옵니다)")
+        grid.addWidget(QLabel("나타남"), 7, 0)
+        grid.addWidget(self.effect_combo, 7, 1, 1, 2)
+
         reset_btn = QPushButton("기본값으로")
         reset_btn.clicked.connect(lambda: self._apply_style(DEFAULT_STYLE))
-        grid.addWidget(reset_btn, 6, 1, 1, 2, Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(reset_btn, 8, 1, 1, 2, Qt.AlignmentFlag.AlignRight)
         self.style_widgets = [
             self.font_combo, self.size_spin, self.bold_check, self.color_btn, self.outline_color_btn,
             self.outline_spin, self.box_check, self.box_color_btn, self.box_opacity_spin,
-            self.position_combo, self.margin_spin, reset_btn,
+            self.position_combo, self.margin_spin, self.highlight_combo, self.highlight_color_btn,
+            self.effect_combo, reset_btn,
         ]  # fmt: skip
         return box
 
@@ -378,6 +442,15 @@ class ComposePage(QWidget):
         grid.addWidget(spin, row, 1, 1, 2)
         return spin
 
+    @staticmethod
+    def _fade_spin() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 10.0)
+        spin.setSingleStep(0.5)
+        spin.setDecimals(1)
+        spin.setSuffix(" 초")
+        return spin
+
     def _build_action_row(self) -> QWidget:
         w = QWidget()
         row = QHBoxLayout(w)
@@ -386,7 +459,7 @@ class ComposePage(QWidget):
 
         self.make_btn = QPushButton("합성하기")
         self.make_btn.setObjectName("primary")
-        self.make_btn.setToolTip("영상에 음성과 자막을 합성해 MP4로 저장합니다 (Ctrl+Enter)")
+        self.make_btn.setToolTip("영상에 음성과 자막을 합성해 저장합니다. 저장 창에서 MP4, GIF, MP3 등 형식을 고를 수 있습니다 (Ctrl+Enter)")
         self.make_btn.clicked.connect(self.make_video)
         self.cancel_btn = QPushButton("취소")
         self.cancel_btn.clicked.connect(self.cancel_render)
@@ -410,18 +483,35 @@ class ComposePage(QWidget):
         return w
 
     def _connect_changes(self) -> None:
-        for combo in (self.fit_combo, self.extend_combo, self.quality_combo, self.mode_combo, self.position_combo):
+        for combo in (self.fit_combo, self.extend_combo, self.quality_combo, self.mode_combo, self.position_combo,
+                      self.highlight_combo, self.effect_combo, self.loudness_combo):  # fmt: skip
             combo.currentIndexChanged.connect(self._refresh)
         for spin in (self.delay_spin, self.tail_spin, self.size_spin, self.outline_spin,
-                     self.box_opacity_spin, self.margin_spin):  # fmt: skip
+                     self.box_opacity_spin, self.margin_spin, self.music_fade_spin, self.fade_in_spin,
+                     self.fade_out_spin):  # fmt: skip
             spin.valueChanged.connect(self._refresh)
-        for slider in (self.voice_slider, self.original_slider):
+        for slider in (self.voice_slider, self.original_slider, self.music_slider):
             slider.valueChanged.connect(self._refresh)
-        for check in (self.bold_check, self.box_check):
+        for check in (self.bold_check, self.box_check, self.duck_check, self.effects_check):
             check.toggled.connect(self._refresh)
-        for button in (self.color_btn, self.outline_color_btn, self.box_color_btn):
+        for button in (self.color_btn, self.outline_color_btn, self.box_color_btn, self.highlight_color_btn):
             button.colorChanged.connect(self._refresh)
         self.font_combo.currentFontChanged.connect(self._refresh)
+
+    def _gpu_toggled(self, on: bool) -> None:
+        if on and encoder.gpu() is None:
+            self.gpu_check.setChecked(False)
+            QMessageBox.information(self, APP_TITLE, "이 PC에서는 그래픽 카드 인코더를 쓸 수 없어서 CPU로 만듭니다.")
+            return
+        encoder.use_gpu = on
+        self.shared.setValue("gpu", on)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.gpu_check.isChecked() != encoder.use_gpu:  # changed in the video tab
+            self.gpu_check.blockSignals(True)
+            self.gpu_check.setChecked(encoder.use_gpu)
+            self.gpu_check.blockSignals(False)
 
     # ---- settings -----------------------------------------------------------
 
@@ -432,6 +522,12 @@ class ComposePage(QWidget):
         self.tail_spin.setValue(job.tail)
         self.voice_slider.setValue(round(job.voice_volume * 100))
         self.original_slider.setValue(round(job.original_volume * 100))
+        self.music_slider.setValue(round(job.music_volume * 100))
+        self.duck_check.setChecked(job.music_duck)
+        self.music_fade_spin.setValue(job.music_fade)
+        self.fade_in_spin.setValue(job.fade_in)
+        self.fade_out_spin.setValue(job.fade_out)
+        select(self.loudness_combo, job.loudness)
         select(self.mode_combo, job.subtitle_mode)
         select(self.quality_combo, job.quality)
 
@@ -447,6 +543,9 @@ class ComposePage(QWidget):
         self.box_opacity_spin.setValue(st.box_opacity)
         select(self.position_combo, st.position)
         self.margin_spin.setValue(st.margin)
+        select(self.highlight_combo, st.highlight)
+        self.highlight_color_btn.set_color(st.highlight_color)
+        select(self.effect_combo, st.effect)
         self._refresh()
 
     def current_style(self) -> SubStyle:
@@ -462,9 +561,12 @@ class ComposePage(QWidget):
             box_opacity=self.box_opacity_spin.value(),
             position=self.position_combo.currentData(),
             margin=self.margin_spin.value(),
+            highlight=self.highlight_combo.currentData(),
+            highlight_color=self.highlight_color_btn.color(),
+            effect=self.effect_combo.currentData(),
         )
 
-    def current_job(self, output: Path) -> render.Job:
+    def current_job(self, output: Path, fmt: formats.Format = formats.DEFAULT) -> render.Job:
         return render.Job(
             video=self.files["video"],
             output=output,
@@ -479,6 +581,15 @@ class ComposePage(QWidget):
             subtitle_mode=self.mode_combo.currentData(),
             style=self.current_style(),
             quality=self.quality_combo.currentData(),
+            music=self.files["music"],
+            music_volume=self.music_slider.value() / 100,
+            music_duck=self.duck_check.isChecked(),
+            music_fade=self.music_fade_spin.value(),
+            effects=list(self.effects) if self.effects_check.isChecked() else [],
+            fade_in=self.fade_in_spin.value(),
+            fade_out=self.fade_out_spin.value(),
+            loudness=self.loudness_combo.currentData(),
+            format=fmt.key,
         )
 
     def _restore(self) -> None:
@@ -523,7 +634,7 @@ class ComposePage(QWidget):
                     info = media.probe(path)
                     if kind == "video" and not info.has_video:
                         raise ValueError(f"영상이 들어 있지 않은 파일입니다: {path.name}")
-                    if kind == "audio" and not info.has_audio:
+                    if kind in ("audio", "music") and not info.has_audio:
                         raise ValueError(f"소리가 들어 있지 않은 파일입니다: {path.name}")
                     if info.duration <= 0:  # e.g. a WebM recorded by streaming, which never states its length
                         raise ValueError(f"길이를 알 수 없는 파일입니다: {path.name}\nMP4 등으로 바꾼 뒤 다시 넣어 주세요.")
@@ -537,8 +648,11 @@ class ComposePage(QWidget):
         self.files[kind] = path
         if kind == "video":
             self.video_info = info
+            self.effects = []  # sound effects from the video tab belong to the video it sent, not to another one
         elif kind == "audio":
             self.audio_info = info
+        elif kind == "music":
+            self.music_info = info
         else:
             self.cues = cues
         edit = self.file_edits[kind]
@@ -571,16 +685,41 @@ class ComposePage(QWidget):
         else:
             self._show_status("음성과 자막을 받았습니다. 확인한 뒤 [합성하기]를 누르세요.")
 
-    def receive_video(self, video: Path) -> None:
-        """A video made in the video tab, to put the voice and subtitles on."""
+    def receive_video(self, video: Path, extras: dict | None = None) -> None:
+        """A video made in the video tab, to put the voice and subtitles on.
+
+        `extras` carries the video tab's background music and its settings, and subtitles edited there.
+        """
         if not self.set_file("video", video):
             return
+        extras = extras or {}
+        notes = []
+        if extras.get("subtitle") and self.set_file("subtitle", Path(extras["subtitle"])):
+            notes.append("영상 만들기에서 고친 자막")
+        if extras.get("music"):
+            if self.set_file("music", Path(extras["music"])):
+                self.music_slider.setValue(round(extras.get("music_volume", 0.3) * 100))
+                self.duck_check.setChecked(extras.get("music_duck", True))
+                self.music_fade_spin.setValue(extras.get("music_fade", 2.0))
+                notes.append("배경 음악")
+        elif "music" in extras and self.files["music"] is not None:
+            self.set_file("music", None)  # the video tab has no music any more
+        self.effects = [(Path(p), at, volume) for p, at, volume in extras.get("effects", [])]
+        if "fade_in" in extras:  # the video tab's fades go on the finished video
+            self.fade_in_spin.setValue(extras["fade_in"])
+            self.fade_out_spin.setValue(extras.get("fade_out", 0.0))
+            if extras["fade_in"] or extras.get("fade_out"):
+                notes.append("시작·끝 페이드")
+        if self.effects:
+            self.effects_check.setChecked(True)
+            notes.append(f"효과음 {len(self.effects)}개")
+        self._refresh()
         if self.video_info.has_audio and self.original_slider.value() == 0:
             # It only has sound when a scene asked for its clip's sound; "원본 소리: 끔" would drop it.
             self.original_slider.setValue(100)
-            self._show_status("영상을 받았습니다. 장면의 클립 소리가 들어 있어서 [원본 소리]를 100%로 맞췄습니다.")
-        else:
-            self._show_status("영상을 받았습니다. 확인한 뒤 [합성하기]를 누르세요.")
+            notes.append("클립 소리가 있어 [원본 소리] 100%")
+        extra = f" ({', '.join(notes)}도 함께)" if notes else ""
+        self._show_status(f"영상을 받았습니다{extra}. 확인한 뒤 [합성하기]를 누르세요.")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -618,6 +757,14 @@ class ComposePage(QWidget):
         self.delay_spin.setEnabled(has_audio)
         self.voice_slider.setEnabled(has_audio)
         self.original_slider.setEnabled(self.video_info is None or self.video_info.has_audio)
+        has_music = self.files["music"] is not None
+        self.music_slider.setEnabled(has_music)
+        self.music_fade_spin.setEnabled(has_music)
+        self.duck_check.setEnabled(has_music and has_audio)
+        self.effects_check.setText(f"[② 영상 만들기]에서 넣은 효과음 {len(self.effects)}개 넣기")
+        for widget in (self.effects_label, self.effects_check):
+            widget.setVisible(bool(self.effects))
+        self.save_timer.start()
 
         burn = self.mode_combo.currentData() == "burn"
         for w in self.style_widgets:
@@ -627,6 +774,7 @@ class ComposePage(QWidget):
         self.outline_spin.setEnabled(burn and not box)
         self.box_color_btn.setEnabled(burn and box)
         self.box_opacity_spin.setEnabled(burn and box)
+        self.highlight_color_btn.setEnabled(burn and self.highlight_combo.currentData() != "none")
 
         self.summary_label.setText(self._summary())
         self._on_position_changed()
@@ -638,6 +786,8 @@ class ComposePage(QWidget):
             return self.video_info.describe()
         if kind == "audio" and self.audio_info:
             return f"길이 {format_time(self.audio_info.duration, precise=True)}"
+        if kind == "music" and self.music_info:
+            return f"길이 {format_time(self.music_info.duration, precise=True)} · 결과 길이만큼 반복합니다"
         if kind == "subtitle" and self.files["subtitle"]:
             if not self.cues:
                 return "자막 줄이 없습니다"
@@ -662,7 +812,7 @@ class ComposePage(QWidget):
             lines.append(f"영상 끝 {-gap:.1f}초는 잘립니다.")
         if self.cues and max(c.end for c in self.cues) + job.delay > duration + 0.05:
             lines.append("자막 일부가 결과보다 늦게 끝나 잘립니다.")
-        if self.audio_info is None and not (video.has_audio and job.original_volume > 0):
+        if self.audio_info is None and self.music_info is None and not job.effects and not (video.has_audio and job.original_volume > 0):
             lines.append("결과에 소리가 없습니다.")
         return "\n".join(lines)
 
@@ -733,6 +883,24 @@ class ComposePage(QWidget):
         pixmap.loadFromData(bmp, "BMP")
         self.screen.show_frame(pixmap)
 
+    def save_frame(self) -> None:
+        """Save the frame on the preview (full size, with its subtitle) as a picture."""
+        frame = self.screen.current_frame()
+        if frame.isNull():
+            return
+        stem = self.files["audio"] or self.files["video"]
+        start = (stem.parent if stem else Path.home()) / f"{stem.stem if stem else '장면'}_썸네일.png"
+        name, _ = QFileDialog.getSaveFileName(self, "이미지로 저장", str(start), "PNG 이미지 (*.png);;JPG 이미지 (*.jpg)")
+        if not name:
+            return
+        path = Path(name)
+        if path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+            path = path.with_suffix(".png")
+        if frame.save(str(path), quality=95):
+            self._show_status(f"이미지로 저장했습니다: {path} ({frame.width()}×{frame.height()})")
+        else:
+            QMessageBox.warning(self, APP_TITLE, f"이미지를 저장하지 못했습니다: {path}")
+
     def _preview_finished(self) -> None:
         self.preview_thread.deleteLater()
         self.preview_thread = None
@@ -748,15 +916,15 @@ class ComposePage(QWidget):
         if self.files["audio"] is None and self.files["subtitle"] is None:
             QMessageBox.information(self, APP_TITLE, "영상에 입힐 음성이나 자막을 하나 이상 고르세요.")
             return
-        default = render.default_output(self.files["video"], self.files["audio"])
-        path, _ = QFileDialog.getSaveFileName(self, "영상 저장", str(default), "MP4 영상 (*.mp4)")
+        last = formats.by_key(self.store.value("format", formats.DEFAULT.key, type=str))
+        default = render.default_output(self.files["video"], self.files["audio"], last)
+        path, chosen = QFileDialog.getSaveFileName(self, "저장", str(default), formats.dialog_filters(), last.dialog_filter)
         if not path:
             return
-        output = Path(path)
-        if output.suffix.lower() != ".mp4":
-            output = output.with_name(output.name + ".mp4")
+        output, fmt = formats.from_dialog(path, chosen)
+        self.store.setValue("format", fmt.key)
 
-        thread = RenderThread(self.current_job(output), self)
+        thread = RenderThread(self.current_job(output, fmt), self)
         thread.progress.connect(self._on_progress)
         thread.done.connect(self._on_done)
         thread.failed.connect(self._on_failed)
@@ -790,7 +958,8 @@ class ComposePage(QWidget):
         )
         box = QMessageBox(self)
         box.setWindowTitle(APP_TITLE)
-        box.setText(f"영상을 만들었습니다.\n\n{output}")
+        made = "영상을" if formats.by_key(thread.job.format).video else "소리 파일을"
+        box.setText(f"{made} 만들었습니다.\n\n{output}")
         play_btn = box.addButton("재생", QMessageBox.ButtonRole.ActionRole)
         folder_btn = box.addButton("폴더 열기", QMessageBox.ButtonRole.ActionRole)
         box.addButton("확인", QMessageBox.ButtonRole.AcceptRole)
@@ -827,4 +996,5 @@ class ComposePage(QWidget):
             self.render_thread.wait(10_000)
         if self.preview_thread is not None:
             self.preview_thread.wait(5_000)
+        self.save_timer.stop()
         self._save_store()

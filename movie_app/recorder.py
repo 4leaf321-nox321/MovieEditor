@@ -1,4 +1,5 @@
-"""Screen recording for the video tab: pick an area (or a whole monitor) and record it with FFmpeg's ddagrab.
+"""Screen recording for the video tab: pick an area (or a whole monitor) and record it with FFmpeg's ddagrab,
+with the microphone and the computer's own sound if wanted.
 
 The red frame around the area and the little control panel are left out of the recording by Windows
 (SetWindowDisplayAffinity), so they can sit anywhere, even over the recorded area.
@@ -6,18 +7,20 @@ The red frame around the area and the little control panel are left out of the r
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QRect, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, QSettings, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QKeyEvent, QPainter, QPen, QScreen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QWidget
 
-from . import media, paths, screens
+from . import audio_capture, media, paths, screens
 from .media import format_time
 
 FPS = 30
@@ -54,7 +57,7 @@ class AreaPicker(QWidget):
     cancelled = Signal()
     started = Signal(object)  # this picker, when a drag begins (the others then clear theirs)
 
-    def __init__(self, screen: QScreen, aspect: float, parent=None):
+    def __init__(self, screen: QScreen, aspect: float, sound: tuple[bool, bool] = (False, False), parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -73,9 +76,26 @@ class AreaPicker(QWidget):
         self.start_btn.clicked.connect(self.confirm)
         self.cancel_btn = QPushButton("취소", self)
         self.cancel_btn.clicked.connect(self.cancelled.emit)
-        for b in (self.start_btn, self.cancel_btn):
+        # What sound goes in, chosen next to the buttons.
+        self.sound_box = QWidget(self)
+        self.sound_box.setStyleSheet("QWidget { background: #111827; border-radius: 8px; } QCheckBox { color: #ffffff; padding: 2px 6px; }")
+        row = QHBoxLayout(self.sound_box)
+        row.setContentsMargins(6, 4, 6, 4)
+        self.mic_check = QCheckBox("마이크")
+        self.mic_check.setChecked(sound[0])
+        self.mic_check.setEnabled(audio_capture.has_microphone())
+        self.system_check = QCheckBox("컴퓨터 소리")
+        self.system_check.setChecked(sound[1])
+        self.system_check.setToolTip("스피커로 나오는 소리 (영상, 음악, 알림 소리 등)")
+        row.addWidget(self.mic_check)
+        row.addWidget(self.system_check)
+        self.sound_box.adjustSize()
+        for b in (self.start_btn, self.cancel_btn, self.sound_box):
             b.setCursor(Qt.CursorShape.ArrowCursor)
             b.hide()
+
+    def sound(self) -> tuple[bool, bool]:
+        return self.mic_check.isChecked() and self.mic_check.isEnabled(), self.system_check.isChecked()
 
     # ---- area -----------------------------------------------------------
 
@@ -84,6 +104,7 @@ class AreaPicker(QWidget):
         self.anchor = None
         self.start_btn.hide()
         self.cancel_btn.hide()
+        self.sound_box.hide()
         self.update()
 
     def physical(self, rect: QRect) -> tuple[int, int, int, int]:
@@ -118,6 +139,7 @@ class AreaPicker(QWidget):
         self.selection = QRect(self.anchor, self.anchor)
         self.start_btn.hide()
         self.cancel_btn.hide()
+        self.sound_box.hide()
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -141,14 +163,16 @@ class AreaPicker(QWidget):
             return
         # Buttons just below the area, or above it when there is no room below.
         size = self.start_btn.sizeHint()
+        cancel_w, sound_w = self.cancel_btn.sizeHint().width(), self.sound_box.width()
         y = self.selection.bottom() + 10
         if y + size.height() > self.height():
             y = max(0, self.selection.top() - size.height() - 10)
-        x = min(self.selection.left(), self.width() - size.width() - self.cancel_btn.sizeHint().width() - 20)
+        x = max(0, min(self.selection.left(), self.width() - size.width() - cancel_w - sound_w - 30))
         self.start_btn.move(x, y)
         self.cancel_btn.move(x + size.width() + 8, y)
-        self.start_btn.show()
-        self.cancel_btn.show()
+        self.sound_box.move(x + size.width() + cancel_w + 20, y + (size.height() - self.sound_box.height()) // 2)
+        for widget in (self.start_btn, self.cancel_btn, self.sound_box):
+            widget.show()
         self.update()
 
     def mouseDoubleClickEvent(self, event):
@@ -271,20 +295,32 @@ class RecordingPanel(QWidget):
 
 
 class ScreenRecorder(QObject):
-    """Runs one recording: pick an area, count down, record, stop. Emits the saved file or None."""
+    """Runs one recording: pick an area, count down, record, stop. Emits the saved file or None.
+
+    Sound is recorded beside the picture (see audio_capture) and lined up with it when the recording
+    stops: FFmpeg's progress reports tell when its first frame was taken.
+    """
 
     finished = Signal(object)  # Path, or None when cancelled
     failed = Signal(str)
 
-    def __init__(self, aspect: float, parent=None):
+    def __init__(self, aspect: float, store: QSettings | None = None, parent=None, fps: int = FPS):
         super().__init__(parent)
         self.aspect = aspect
+        self.fps = fps  # frames per second recorded
+        self.store = store  # remembers which sound was wanted last time
         self.pickers: list[AreaPicker] = []
         self.frame: RecordingFrame | None = None
         self.panel: RecordingPanel | None = None
         self.proc: subprocess.Popen | None = None
         self.region: Region | None = None
         self.output: Path | None = None
+        self.sound = (False, False)  # (microphone, the computer's sound)
+        self.captures: list[audio_capture._Capture] = []
+        self.notes: list[str] = []  # told to the user with the result (e.g. a sound that could not be recorded)
+        self._video_start: float | None = None  # perf_counter when the first frame was taken
+        self._launched = 0.0  # perf_counter when FFmpeg was started
+        self._reader: threading.Thread | None = None
         self._temp = tempfile.TemporaryDirectory(prefix="movie_rec_")
         self._log = Path(self._temp.name) / "ffmpeg.log"
         self._countdown = 0
@@ -297,9 +333,12 @@ class ScreenRecorder(QObject):
         if not screens.outputs():
             self.failed.emit("화면 녹화를 쓸 수 없는 환경입니다 (원격 데스크톱 등).")
             return
+        wanted = (False, False)
+        if self.store is not None:
+            wanted = (self.store.value("record_mic", False, type=bool), self.store.value("record_system", False, type=bool))
         for screen in QGuiApplication.screens():
-            picker = AreaPicker(screen, self.aspect)
-            picker.picked.connect(self._picked)
+            picker = AreaPicker(screen, self.aspect, wanted)
+            picker.picked.connect(lambda region, p=picker: self._picked(region, p.sound()))
             picker.cancelled.connect(self._cancel_picking)
             picker.started.connect(self._picker_started)
             picker.show()
@@ -324,9 +363,13 @@ class ScreenRecorder(QObject):
         self._close_pickers()
         self.finished.emit(None)
 
-    def _picked(self, region: Region) -> None:
+    def _picked(self, region: Region, sound: tuple[bool, bool] = (False, False)) -> None:
         self._close_pickers()
         self.region = region
+        self.sound = sound
+        if self.store is not None:
+            self.store.setValue("record_mic", sound[0])
+            self.store.setValue("record_system", sound[1])
         self.frame = RecordingFrame(region.area)
         self.panel = RecordingPanel(region.area)
         self.panel.stop.connect(self.stop)
@@ -357,37 +400,68 @@ class ScreenRecorder(QObject):
         # Matroska survives a hard stop; it is turned into MP4 once the recording ends.
         self._raw = Path(self._temp.name) / "recording.mkv"
         grab = (
-            f"ddagrab=output_idx={region.output}:framerate={FPS}:draw_mouse=1"
+            f"ddagrab=output_idx={region.output}:framerate={self.fps}:draw_mouse=1"
             f":video_size={region.width}x{region.height}:offset_x={region.x}:offset_y={region.y}"
             ",hwdownload,format=bgra"
         )
+        # Sound starts first, so it is already running when the first frame is taken; the part before that
+        # is cut off afterwards.
+        folder = Path(self._temp.name)
+        if self.sound[0]:
+            self.captures.append(audio_capture.MicCapture(folder / "mic.wav"))
+        if self.sound[1]:
+            self.captures.append(audio_capture.LoopbackCapture(folder / "system.wav"))
+        for capture in self.captures:
+            capture.start()
+        self._launched = time.perf_counter()
         with self._log.open("w", encoding="utf-8") as err:
             self.proc = subprocess.Popen(
                 [
                     paths.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", grab,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p",
-                    str(self._raw),
+                    # zerolatency: frames are written as soon as they are taken, so the progress reports tell
+                    # when the first one was taken (x264 otherwise holds a frame per thread).
+                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-progress", "pipe:1", "-stats_period", "0.1", str(self._raw),
                 ],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=err,
                 creationflags=media.NO_WINDOW,
             )  # fmt: skip
+        self._reader = threading.Thread(target=self._read_progress, args=(self.proc,), daemon=True)
+        self._reader.start()
         self._started_at = time.monotonic()
         self.panel.stop_btn.setEnabled(True)
         self.timer.start()
         self._tick()
+
+    def _read_progress(self, proc: subprocess.Popen) -> None:
+        """When the first frame was taken: each report says how much video is out by now."""
+        for raw in proc.stdout:
+            key, _, value = raw.decode("utf-8", errors="replace").strip().partition("=")
+            if key == "out_time_us" and value.isdigit() and int(value) > 0:
+                # out_time is where the last frame written ends; that frame was taken one frame earlier.
+                start = time.perf_counter() - int(value) / 1e6 + 1 / self.fps
+                # A report can only come late, never early, so the earliest estimate is the best.
+                if self._video_start is None or start < self._video_start:
+                    self._video_start = start
 
     def _tick(self) -> None:
         if self.proc is not None and self.proc.poll() is not None:
             # FFmpeg stopped on its own: the screen could not be captured.
             self.timer.stop()
             message = self._log.read_text(encoding="utf-8", errors="replace").strip()[-400:]
+            self._stop_sound()
             self._cleanup()
             self.failed.emit(f"화면을 녹화하지 못했습니다.\n{message}")
             return
-        self.panel.show_text(f"● 녹화 중  {format_time(time.monotonic() - self._started_at)}")
+        sound = " · ".join(name for name, on in (("마이크", self.sound[0]), ("컴퓨터 소리", self.sound[1])) if on)
+        self.panel.show_text(f"● 녹화 중  {format_time(time.monotonic() - self._started_at)}" + (f"  ({sound})" if sound else ""))
+
+    def _stop_sound(self) -> None:
+        for capture in self.captures:
+            capture.stop()
 
     def stop(self) -> None:
         if self.proc is None:
@@ -397,30 +471,85 @@ class ScreenRecorder(QObject):
         self.panel.stop_btn.setEnabled(False)
         QGuiApplication.processEvents()
         try:
-            self.proc.communicate(b"q", timeout=15)  # FFmpeg finishes the file when it reads "q"
+            self.proc.stdin.write(b"q")  # FFmpeg finishes the file when it reads "q"
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait()
         self.proc = None
-        try:
-            subprocess.run(
-                [paths.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", str(self._raw),
-                 "-c", "copy", "-movflags", "+faststart", str(self.output)],
-                check=True, capture_output=True, creationflags=media.NO_WINDOW,
-            )  # fmt: skip
-        except (OSError, subprocess.CalledProcessError) as e:
+        self._stop_sound()
+        if self._reader is not None:
+            self._reader.join(2)
+        error = self._finish(self._finish_args())
+        if error and any(c.ok for c in self.captures):
+            # The sound would not go in: keep at least the picture.
+            self.notes.append("소리를 합치지 못해 화면만 저장했습니다.")
+            error = self._finish(self._finish_args(with_sound=False))
+        if error:
+            # Not even that: the raw recording is kept where the recordings go, rather than thrown away.
+            kept = self.output.with_suffix(".mkv")
+            try:
+                shutil.move(str(self._raw), kept)
+                error += f"\n\n원본 녹화는 남겨 두었습니다: {kept}"
+            except OSError:
+                pass
             self._cleanup()
-            self.failed.emit(f"녹화를 저장하지 못했습니다.\n{e}")
+            self.failed.emit(f"녹화를 저장하지 못했습니다.\n{error}")
             return
         output = self.output
         self._cleanup()
         self.finished.emit(output)
+
+    def _finish(self, args: list[str]) -> str:
+        """Run the final FFmpeg step; what went wrong, or "" when it worked."""
+        try:
+            subprocess.run(args, check=True, capture_output=True, creationflags=media.NO_WINDOW)
+        except OSError as e:
+            return str(e)
+        except subprocess.CalledProcessError as e:
+            return (e.stderr or b"").decode("utf-8", errors="replace").strip()[-600:] or f"FFmpeg 오류 (코드 {e.returncode})"
+        return ""
+
+    def _finish_args(self, with_sound: bool = True) -> list[str]:
+        """FFmpeg arguments making the MP4: the picture as it is, and the sound lined up with it."""
+        args = [paths.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", str(self._raw)]
+        sounds = []
+        if self._video_start is None and any(c.ok for c in self.captures):
+            # No progress report was read (stopped at once): line the sound up with when FFmpeg was started.
+            self._video_start = self._launched
+            self.notes.append("소리와 화면이 조금 어긋날 수 있습니다.")
+        for capture in self.captures if with_sound else []:
+            if capture.ok:
+                sounds.append(capture)
+            elif capture.error:
+                self.notes.append(f"{capture.error} — 소리 없이 저장했습니다.")
+            if capture.ok and capture.note:
+                self.notes.append(capture.note)
+        if not sounds:
+            return [*args, "-c", "copy", "-movflags", "+faststart", str(self.output)]
+        graph, labels = [], []
+        for k, capture in enumerate(sounds, 1):
+            args += ["-i", str(capture.path)]
+            offset = capture.start_time - self._video_start
+            # Sound that began before the first frame is cut; sound that began after it is delayed.
+            shift = f"adelay={round(offset * 1000)}:all=1" if offset >= 0 else f"atrim=start={-offset:.3f},asetpts=PTS-STARTPTS"
+            graph.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,{shift}[s{k}]")
+            labels.append(f"[s{k}]")
+        mix = f"amix=inputs={len(labels)}:duration=longest:normalize=0," if len(labels) > 1 else ""
+        graph.append(f"{''.join(labels)}{mix}apad[a]")
+        return [*args, "-filter_complex", ";".join(graph), "-map", "0:v", "-map", "[a]", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(self.output)]  # fmt: skip
 
     def cancel(self) -> None:
         if self.proc is not None:
             self.proc.kill()
             self.proc.wait()
             self.proc = None
+        self._stop_sound()
         self.timer.stop()
         self._cleanup()
         self.finished.emit(None)
@@ -431,4 +560,7 @@ class ScreenRecorder(QObject):
                 window.close()
                 window.deleteLater()
         self.frame = self.panel = None
-        self._temp.cleanup()
+        try:
+            self._temp.cleanup()
+        except OSError:
+            pass  # a sound file still held; the system clears its temporary folder later
