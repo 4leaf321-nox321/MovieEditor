@@ -234,7 +234,7 @@ Claude는 보통 이 순서로 도구를 씁니다.
 - 장면 캐시는 편집기와 따로(`작업\장면캐시_MCP`) 써서, 편집기를 켜 둔 채 같이 써도 서로 방해하지 않습니다. 그래픽 카드 인코딩은 편집기의 설정을 따릅니다.
 - **연결 설정**: Claude Code는 사용자 설정(`%USERPROFILE%\.claude.json`, 모든 폴더에서 쓰임)에, Claude Desktop은 `%APPDATA%\Claude\claude_desktop_config.json`에 `movie-editor`로 들어 있습니다. 둘 다 이 PC의 `.venv\Scripts\python.exe mcp_server.py`를 실행합니다. Claude Desktop은 설정을 바꾼 뒤 트레이에서 완전히 종료하고 다시 켜야 불러옵니다.
   - 다시 등록: `claude mcp add --scope user movie-editor -- "<폴더>\.venv\Scripts\python.exe" "<폴더>\mcp_server.py"` / 빼기: `claude mcp remove movie-editor -s user`
-  - **exe 버전**은 같은 폴더의 `movie-mcp.exe`가 MCP 서버입니다: `claude mcp add --scope user movie-editor -- "<exe 폴더>\movie-mcp.exe"`, Claude Desktop 설정에는 `"command": "<exe 폴더>\movie-mcp.exe"`(args 없음)로 넣습니다. 프로그램을 쓰지 않을 때도 Claude가 알아서 켜고 끕니다.
+  - **exe 버전**은 같은 폴더의 `movie-mcp.exe`가 MCP 서버입니다: `claude mcp add --scope user movie-editor -- "<exe 폴더>\movie-mcp.exe"`, Claude Desktop 설정에는 `"command": "<exe 폴더>\\movie-mcp.exe"`(JSON이라 역슬래시 두 개, args 없음)로 넣습니다. 프로그램을 쓰지 않을 때도 Claude가 알아서 켜고 끕니다.
 
 ## 명령줄
 
