@@ -4,6 +4,7 @@ Text is synthesized one segment at a time. A line break or sentence-ending
 punctuation ends a segment, and a blank line ends a paragraph (a longer pause
 follows). Each segment also becomes one subtitle cue. A pause mark such as
 [쉼 2초] becomes a segment of its own that asks for exactly that much silence.
+A reading mark such as {14번|열네 번} stays whole: the subtitle shows 14번 and the voice says 열네 번.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from .reading import READING_MARK, written
 
 AUTO_LANG = "auto"
 
@@ -27,11 +30,17 @@ MAX_PAUSE = 60.0
 
 @dataclass
 class Segment:
-    text: str  # empty for a pause mark
+    text: str  # as shown in the subtitles; empty for a pause mark
     lang: str
     paragraph_end: bool = False
     line: int = 0  # the source line it came from, counting from 0
     pause: float | None = None  # seconds of silence asked for by a pause mark
+    source: str = ""  # as written, with its reading marks; empty when it has none
+
+    @property
+    def to_read(self) -> str:
+        """What the reader turns into speech: the text with its reading marks."""
+        return self.source or self.text
 
     @property
     def is_pause(self) -> bool:
@@ -112,11 +121,23 @@ def split_long(sentence: str, max_chars: int) -> list[str]:
 
 
 def _sentences(text: str, lang: str, line: int) -> list[Segment]:
+    # Reading marks stand in as one private character each while splitting, so no mark is cut in two.
+    marks: list[str] = []
+
+    def hide(m: re.Match) -> str:
+        marks.append(m.group(0))
+        return chr(0xF000 + len(marks) - 1)
+
+    def shown(piece: str) -> str:
+        return re.sub("[\uf000-\uf8ff]", lambda m: marks[ord(m.group(0)) - 0xF000], piece)
+
     segments = []
-    for sentence in split_sentences(text.strip()):
-        seg_lang = detect_lang(sentence) if lang == AUTO_LANG else lang
+    for sentence in split_sentences(READING_MARK.sub(hide, text.strip())):
+        seg_lang = detect_lang(written(shown(sentence))) if lang == AUTO_LANG else lang
         limit = MAX_CHARS_CJK if seg_lang in ("ko", "ja") else MAX_CHARS_OTHER
-        segments += [Segment(piece, seg_lang, line=line) for piece in split_long(sentence, limit)]
+        for piece in split_long(sentence, limit):
+            source = shown(piece)
+            segments.append(Segment(written(source), seg_lang, line=line, source=source if marks else ""))
     return segments
 
 

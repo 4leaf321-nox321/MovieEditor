@@ -2287,6 +2287,120 @@ def frame(layers: list[dict], style_name: str, width: int, height: int, t: float
     return image
 
 
+# ---- where layers land -----------------------------------------------------------------------------------
+
+LAYOUT_WIDTH = 640  # each layer is drawn on its own this wide to see where its pixels go
+LAYOUT_MARGIN = 0.25  # room round the frame, as a share of its sides, to catch what spills off it
+LAYOUT_SLACK = 0.004  # off the frame by less than this share of it (about 8 px across 1920) is only anti-aliasing
+LAYOUT_ALPHA = 40  # pixels fainter than this (of 255) are a smoothed edge, not the layer
+LAYOUT_UNDER = 30  # a layer with this many pixels (at LAYOUT_WIDTH) where the subtitles go is under them
+FILL_KINDS = ("image", "frames", "video")  # with a fit they fill the frame on purpose
+KEEP_CLEAR = ("text", "counter", "tiles", "curve", "bars", "prop", "image", "frames", "video", "plugin", *GROUPS)
+SIDE_WORDS = {"left": "왼쪽으로", "right": "오른쪽으로", "top": "위로", "bottom": "아래로"}
+
+
+def _landing(layer: dict, state: State, ctx: Ctx, scale: float, clear) -> tuple[tuple, int] | None:
+    """Where one layer puts its pixels: (left, top, right, bottom) as shares of the frame, beyond 0–1 when off it,
+    and how many of them fall in `clear` (a box like that, where the subtitles go). None when it draws nothing."""
+    mx, my = ctx.width * LAYOUT_MARGIN, ctx.height * LAYOUT_MARGIN
+    image = QImage(max(1, round((ctx.width + 2 * mx) * scale)), max(1, round((ctx.height + 2 * my) * scale)),
+                   QImage.Format.Format_ARGB32_Premultiplied)  # fmt: skip
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.scale(scale, scale)
+        painter.translate(mx, my)
+        _paint(painter, layer, ctx, state)
+    finally:
+        painter.end()
+    pixels = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine() // 4, 4)
+    solid = pixels[:, : image.width(), 3] >= LAYOUT_ALPHA
+    rows, cols = np.flatnonzero(solid.any(axis=1)), np.flatnonzero(solid.any(axis=0))
+    if not rows.size:
+        return None
+
+    def across(px: float) -> float:
+        return (px / scale - mx) / ctx.width
+
+    def down(px: float) -> float:
+        return (px / scale - my) / ctx.height
+
+    under = 0
+    if clear:
+        left, right = (round((share * ctx.width + mx) * scale) for share in (clear[0], clear[2]))
+        top, bottom = (round((share * ctx.height + my) * scale) for share in (clear[1], clear[3]))
+        under = int(solid[top:bottom, left:right].sum())
+    return (across(cols[0]), down(rows[0]), across(cols[-1] + 1), down(rows[-1] + 1)), under
+
+
+def _settled(layer: dict, state: State) -> bool:
+    """Whether the layer has finished coming on and is not yet going (so it is where it means to be)."""
+    if state.raw_in < 1 or state.p_out > 0:
+        return False
+    letters = len(str(layer.get("text", ""))) if state.enter in CHAR_EFFECTS else 0
+    return state.t >= state.enter_seconds + state.stagger * max(0, letters - 1) - 1e-9
+
+
+def _spill(box: tuple) -> dict:
+    left, top, right, bottom = box
+    sides = {"left": -left, "right": right - 1, "top": -top, "bottom": bottom - 1}
+    return {side: amount for side, amount in sides.items() if amount > LAYOUT_SLACK}
+
+
+def _named(layer: dict, index: int) -> str:
+    kind = layer.get("type")
+    words = layer.get("text") or layer.get("name") or layer.get("plugin") or ""
+    if kind in GROUPS:
+        words = f"안에 {len(layer.get('layers') or [])}개"
+    words = " ".join(str(words).split())
+    return f"layers[{index}] ({kind}" + (f' "{words[:24]}{"…" if len(words) > 24 else ""}"' if words else "") + ")"
+
+
+def layout_problems(layers: list[dict], style_name: str, width: int, height: int, duration: float, times: list[float],
+                    subtitles: tuple[float, float, float, float] | None = None) -> list[str]:  # fmt: skip
+    """Layers that are partly off the frame, or under the subtitles (where they go: left, top, right, bottom as shares
+    of the frame), at every one of `times` when they are on and settled — in words, with how far.
+
+    A layer only off the frame while it slides or moves in is not one: it has to stay off once it has arrived."""
+    try:
+        st = style(style_name)
+    except ValueError:
+        return []
+    ctx = Ctx(st, width, height, duration)
+    scale = LAYOUT_WIDTH / max(width, height)
+    problems = []
+    for index, raw in enumerate(layers):
+        kind = raw.get("type") if isinstance(raw, dict) else None
+        if kind in (None, "background") or (kind in FILL_KINDS and raw.get("fit") in ("cover", "contain")):
+            continue
+        landed = []
+        try:
+            for t in times:
+                timed = _timed(raw, t, ctx, {})
+                if timed is not None and _settled(*timed):
+                    spot = _landing(timed[0], timed[1], ctx, scale, subtitles if kind in KEEP_CLEAR else None)
+                    if spot is not None:
+                        landed.append(spot)
+        except (ValueError, TypeError, KeyError, ZeroDivisionError, OverflowError):
+            continue  # what is wrong with it is check_layers' to say
+        if not landed:
+            continue
+        spills = [_spill(box) for box, _under in landed]
+        if all(spills):
+            worst = max(range(len(spills)), key=lambda k: max(spills[k].values()))
+            left, top, right, bottom = landed[worst][0]
+            # As far out as it is looked for: it may go further.
+            sides = ", ".join(f"{SIDE_WORDS[side]} " + (f"{LAYOUT_MARGIN:.2f} 이상" if amount >= LAYOUT_MARGIN - 0.005 else f"{amount:.3f}")
+                              for side, amount in spills[worst].items())  # fmt: skip
+            problems.append(f"{_named(raw, index)}: 화면 밖으로 나갑니다 ({sides}, 화면 비율). "
+                            f"그려지는 범위 x {left:.3f}–{right:.3f}, y {top:.3f}–{bottom:.3f}")  # fmt: skip
+        if subtitles and all(under >= LAYOUT_UNDER for _box, under in landed):
+            problems.append(f"{_named(raw, index)}: 자막 자리(세로 {subtitles[1]:.2f}–{subtitles[3]:.2f})와 겹칩니다. "
+                            "위로 올리거나 줄이세요")  # fmt: skip
+    return problems
+
+
 # ---- about a scene's layers ------------------------------------------------------------------------------
 
 _SAMPLE = {"t": 0.0, "lt": 0.0, "d": 1.0, "p": 0.0, "i": 0.0, "n": 1.0, "col": 0.0, "row": 0.0}

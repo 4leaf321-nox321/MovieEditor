@@ -11,6 +11,7 @@ import soundfile as sf
 from pedalboard import PitchShift
 from pedalboard.io import AudioFile
 
+from . import reading
 from .engine import DEFAULT_SPEED, Engine
 from .subtitles import Cue
 from .textproc import Segment
@@ -37,6 +38,8 @@ class Settings:
     steps: int = 8  # diffusion steps: more is slower and slightly cleaner
     sentence_pause: float = 0.3  # seconds
     paragraph_pause: float = 0.8
+    numbers: bool | None = None  # read numbers the Korean way (14개 → 열네 개); None: as the reading dictionary says
+    readings: dict[str, str] = field(default_factory=dict)  # written → said, for this voice on top of the dictionary
 
 
 @dataclass
@@ -110,6 +113,7 @@ class Result:
     cues: list[Cue]
     timeline: Timeline
     removed_chars: list[str] = field(default_factory=list)
+    readings: list[tuple[str, str]] = field(default_factory=list)  # (written, said) for each place read differently
 
     @property
     def duration(self) -> float:
@@ -130,6 +134,8 @@ def render(
     removed: set[str] = set()
     timeline = Timeline()
     spacing = _Spacing(settings)
+    reader = reading.reader(settings.numbers, settings.readings)
+    changed: dict[tuple[str, str], None] = {}
     t = 0  # samples written so far
 
     def silence(seconds: float) -> None:
@@ -148,7 +154,9 @@ def render(
         if on_progress:
             on_progress(i, len(segments), seg.text)
 
-        text, bad = engine.clean(seg.text, settings.voice)
+        said, changes = reader.say(seg.to_read, seg.lang)
+        changed.update(dict.fromkeys(changes))
+        text, bad = engine.clean(said, settings.voice)
         removed.update(bad)
         if not any(ch.isalnum() for ch in text):
             spacing.skip(seg)
@@ -175,7 +183,7 @@ def render(
     timeline.total = t / sr
 
     audio = _finalize(np.concatenate(pieces), settings.volume)
-    return Result(audio, sr, cues, timeline, sorted(removed))
+    return Result(audio, sr, cues, timeline, sorted(removed), list(changed))
 
 
 def estimate(
@@ -187,6 +195,7 @@ def estimate(
     """Predict the timeline render() would produce, from the duration models alone (no audio)."""
     timeline = Timeline()
     spacing = _Spacing(settings)
+    reader = reading.reader(settings.numbers, settings.readings)
     t = 0.0
     for seg in segments:
         if is_cancelled and is_cancelled():
@@ -194,7 +203,7 @@ def estimate(
         if seg.is_pause:
             spacing.mark(seg)
             continue
-        length = engine.estimate(seg.text, settings.voice, seg.lang, settings.speed)
+        length = engine.estimate(reader.say(seg.to_read, seg.lang)[0], settings.voice, seg.lang, settings.speed)
         if length is None:
             spacing.skip(seg)
             continue

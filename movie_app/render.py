@@ -371,3 +371,22 @@ def preview_frame(video: MediaInfo, at: float, text: str | None, style: SubStyle
     if proc.returncode != 0 or not proc.stdout:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip() or "미리보기를 만들지 못했습니다.")
     return proc.stdout
+
+
+def subtitle_stills(folder: Path, texts: list[str | None], style: SubStyle, width: int, height: int) -> list[Path]:
+    """Stills folder/still000.bmp… (width × height) with texts[k] drawn on still k exactly as libass draws it on the
+    video, in one run of FFmpeg: they play one a second, each line shown for its second. Returns the new stills."""
+    (folder / SUBS_FILE).write_text(subs.stills_ass(texts, style, width, height), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            paths.tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-framerate", "1", "-i", "still%03d.bmp", "-vf", f"ass={SUBS_FILE}", "-start_number", "0", "burnt%03d.bmp",
+        ],
+        cwd=folder,
+        capture_output=True,
+        creationflags=media.NO_WINDOW,
+    )  # fmt: skip
+    made = [folder / f"burnt{k:03d}.bmp" for k in range(len(texts))]
+    if proc.returncode != 0 or not all(p.exists() for p in made):
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip() or "자막을 입히지 못했습니다.")
+    return made

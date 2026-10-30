@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anyio
+import numpy as np
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from PySide6.QtCore import QBuffer, QIODevice, QSettings, Qt
@@ -63,6 +64,8 @@ FIT_TOLERANCE = 1.43  # as in the video tab: a picture this much wider or taller
 WAIT = 40.0  # seconds a call waits for its job by default (some clients give up on a call after a minute)
 MAX_WAIT = 300.0
 PREVIEW_WIDTH = 960
+READINGS_SHOWN = 20  # places read differently listed after making a voice
+LAYOUT_SAMPLES = 8  # moments of a graphic scene looked at for layers off the frame or under the subtitles
 RENDER_SHARE = 0.75  # of a finished video's progress, for making the scenes (the rest puts the sound on)
 LOUDNESS_KEYS = ("", *render.LOUDNESS)
 FORMAT_KEYS = tuple(f.key for f in formats.FORMATS)
@@ -146,6 +149,9 @@ INSTRUCTIONS = """동영상 편집기(이 PC의 Windows 프로그램)로 음성�
 
 보통 순서:
 1. make_voice: 대본을 음성(MP3)과 자막(SRT)으로 만듭니다. list_voices로 목소리를 고릅니다.
+   숫자는 단위에 맞춰 한국어로 읽고(14개 → 열네 개, 182 MPa → 백팔십이 메가파스칼), 읽기 사전의 말(약어·단위)도 바꿔 읽습니다.
+   자막은 쓴 그대로입니다. 다르게 읽힐 곳은 대본에 {14번|열네 번}처럼 쓰거나 reading_dictionary에 넣고,
+   preview_reading으로 미리 확인합니다.
 2. new_project(voice=...): 음성의 문장마다 빈 장면을 만들고, 장면 길이를 문장에 맞춥니다(장면의 narration에 문장).
 3. fill_scenes(이미지·영상을 빈 장면에 차례로), update_scene, add_scenes로 그림·글자·겹치기·가리기를 넣습니다.
    필드는 field_guide로 확인합니다.
@@ -160,7 +166,9 @@ INSTRUCTIONS = """동영상 편집기(이 PC의 Windows 프로그램)로 음성�
    영상마다 일회용 그리기 코드(Pillow·MoviePy 등)를 짜는 것보다 이 순서를 먼저 쓰세요.
    같은 종류의 장면(제목, 목록, 큰 숫자, 막대 비교, 해석 결과, 분포, 흐름도, 강조 문장, 사진 설명, 둘 비교)은
    템플릿(list_templates → apply_template)으로 빈칸만 채워 만듭니다. 자주 쓰는 새 틀은 save_template·scene_to_template로 저장.
-4. preview_frame(한 순간)·preview_frames(한 장면의 여러 순간)로 화면을 보고 확인합니다.
+4. preview_frame(한 순간)·preview_frames(한 장면의 여러 순간)로 화면을 보고 확인합니다. 그때의 자막도 최종 영상처럼
+   입혀서 보여 주고, 자막 자리(세로 범위)를 알려 줍니다. 그래픽 장면을 넣거나 고치면 화면 밖으로 나가거나 자막 자리에
+   겹치는 레이어를 "확인할 곳"으로 알려 주니, 좌표를 고쳐 다시 확인합니다.
 5. render_video: 장면 + 음성 + 자막 + 배경 음악 + 효과음을 넣은 최종 영상을 만듭니다(MP4, WebM, GIF 등).
 다른 영상에 음성·자막만 입힐 때는 compose를 씁니다.
 
@@ -177,6 +185,8 @@ export_keyframes(장면 PNG), compare_narration(대본과 실제 음성 비교).
 GRAPHIC_GUIDE = f"""그래픽 장면 — kind "graphic"인 장면은 layers 목록을 차례로 그립니다(뒤에 적은 것이 위). style은 스타일 이름.
 단위: x, y(가운데), w, h는 화면 비율 0–1 (x·w는 가로, y·h는 세로), r은 짧은 변의 비율. width(선 굵기)·size(글자)·radius·
 blur·offset·head_size는 1080p 기준 px(화면 크기가 달라도 같은 비율). 시간(start, end, keys의 t)은 장면 시작부터 초.
+자막을 입히면 화면 아래는 자막 자리입니다(기본 모양, 16:9에서 한 줄이면 세로 약 0.89–0.95, 두 줄이면 0.84–0.95;
+정확한 자리는 preview_frame이 알려 줌). 글자·그림은 그 위에 둡니다.
 색: 스타일 팔레트 이름("accent", "ink" …) 또는 "#rrggbb"·"#rrggbbaa". 뒤에 "/0.5"를 붙이면 반투명. fill·stroke는 false로 끔.
 
 모든 레이어 공통: start, end(보이는 동안), enter(나타남), exit(사라짐), keys, opacity, rotation(도), scale,
@@ -205,6 +215,7 @@ blur·offset·head_size는 1080p 기준 px(화면 크기가 달라도 같은 비
 - tiles(해석 결과 같은 색 타일): x, y, w, h, rows, cols, values(2차원 숫자 목록, min·max로 범위) 또는
     field{{kind: {"|".join(graphics.FIELD_KINDS)}, seed, smooth, points[[x,y,세기,퍼짐]], center, angle, frequency, power}},
     colormap(스타일 색 지도 이름 또는 색 목록), gap, radius, legend(true 또는 {{min, max, unit, label}}), order(sweep 순서: diagonal|rows|columns|random)
+    legend는 타일 오른쪽에 화면 폭의 약 0.085(막대 0.04 + 값 글자), label은 위로 0.03을 더 차지합니다
 - curve: x, y, w, h, function{{kind: normal(mean, sd)|lognormal(mu, sigma)|exponential(rate)|uniform(a, b)|sine(frequency, amplitude, phase)|
     linear(slope, intercept)|logistic(k, x0)|power(k)}} 또는 points[[x,y],...], x_range, y_range, samples, color, width,
     fill(true 또는 색), axes, ticks(눈금 수), x_label, y_label, shade[a, b](칠할 구간), shade_color, marker{{x, label, color}}
@@ -292,6 +303,12 @@ def tool(fn):
 
     server.add_tool(wrapped, structured_output=False)
     return fn
+
+
+@tool
+def usage_guide() -> str:
+    """이 동영상 편집기로 영상을 만드는 순서와 도구 안내. 처음 쓸 때 먼저 읽으세요 (서버 안내문과 같은 내용)."""
+    return INSTRUCTIONS
 
 
 # ---- paths --------------------------------------------------------------------------------------------
@@ -466,12 +483,18 @@ async def make_voice(
     sentence_pause: float = 0.3,
     paragraph_pause: float = 0.8,
     subtitle_line_chars: int = 30,
+    numbers: bool | None = None,
+    readings: dict | None = None,
     wait_seconds: float = WAIT,
 ) -> str:
     """대본(text 또는 text_file)을 음성 파일(output: .mp3 또는 .wav)과 같은 이름의 자막(.srt)으로 만듭니다. 인터넷 없이 이 PC에서 합성합니다.
     - 문장마다 자막 한 줄이 생기고, 빈 줄은 문단 사이 쉼(paragraph_pause)이 됩니다. 글 중간의 [쉼 2초]는 그 자리에서 2초 쉽니다.
     - voice: list_voices의 ID나 이름. lang: "ko", "en", "ja" 등 또는 "auto"(문장마다 감지). speed 0.7–2.0, pitch는 반음 단위.
-    - steps: 품질 단계(4 빠름, 8 표준, 16 고품질). 숫자·영어 약어는 한글로 풀어 쓰면 더 자연스럽게 읽습니다.
+    - steps: 품질 단계(4 빠름, 8 표준, 16 고품질).
+    - 읽는 법(자막은 쓴 그대로, 소리만 바뀜): 한국어 문장의 숫자는 뒤의 말에 맞춰 읽습니다(14개 → 열네 개, 3시 → 세 시,
+      182 MPa → 백팔십이 메가파스칼; numbers=false면 끔, 비우면 사전 설정대로). 읽기 사전(reading_dictionary)의 말도 바꿔 읽습니다.
+      한 곳만 다르게 읽히려면 대본에 {14번|열네 번}처럼 쓰고, 이 음성에서만 쓸 말은 readings={"FEM": "에프이엠"}.
+      결과에 읽는 법을 바꾼 곳이 나오니 확인하고, 미리 보려면 preview_reading.
     결과 음성을 new_project(voice=...)나 compose(audio=...)에 넣으면 자막도 같이 쓰입니다."""
     from tts_app import pipeline, subtitles, textproc
     from tts_app.engine import MAX_SPEED, MIN_SPEED
@@ -484,7 +507,8 @@ async def make_voice(
         raise ToolError(f"speed는 {MIN_SPEED}에서 {MAX_SPEED} 사이여야 합니다.")
     out = _output(output, "음성", Path(output).suffix.lower() if Path(output).suffix.lower() in (".mp3", ".wav") else ".mp3")
     settings = pipeline.Settings(voice=_voice_id(voice), lang=lang, speed=speed, pitch=pitch, volume=volume / 100,
-                                 steps=steps, sentence_pause=sentence_pause, paragraph_pause=paragraph_pause)  # fmt: skip
+                                 steps=steps, sentence_pause=sentence_pause, paragraph_pause=paragraph_pause,
+                                 numbers=numbers, readings=_readings(readings))  # fmt: skip
     segments = textproc.segment_text(text, lang)
     count = textproc.count_sentences(segments)
     if not count:
@@ -503,9 +527,88 @@ async def make_voice(
         srt = out.with_suffix(".srt")
         subtitles.write_srt(result.cues, srt, subtitle_line_chars)
         note = f"\n읽지 못해 뺀 글자: {' '.join(result.removed_chars)}" if result.removed_chars else ""
+        if result.readings:
+            swaps = ", ".join(f"{a} → {b or '(읽지 않음)'}" for a, b in result.readings[:READINGS_SHOWN])
+            more = f" 외 {len(result.readings) - READINGS_SHOWN}곳" if len(result.readings) > READINGS_SHOWN else ""
+            note += f"\n읽는 법을 바꾼 곳 {len(result.readings)}곳 (자막은 쓴 그대로): {swaps}{more}"
         return f"음성: {out}\n자막: {srt}\n길이 {result.duration:.1f}초 · 문장 {count}개 · 자막 {len(result.cues)}줄{note}"
 
     return await _follow(_start("음성 만들기", work), wait_seconds, ctx)
+
+
+def _readings(words: dict | None) -> dict[str, str]:
+    if words is None:
+        return {}
+    if not isinstance(words, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) for k, v in words.items()):
+        raise ToolError('readings는 {"쓴 글": "읽을 말"} 모양이어야 합니다. 예: {"FEM": "에프이엠", "14번": "열네 번"}')
+    return {k.strip(): v.strip() for k, v in words.items()}
+
+
+@tool
+def preview_reading(text: str = "", text_file: str = "", lang: str = "ko", numbers: bool | None = None,
+                    readings: dict | None = None, all_sentences: bool = False) -> str:  # fmt: skip
+    """대본을 실제로 어떻게 읽을지 문장마다 보여 줍니다(음성은 만들지 않음). make_voice 전에 숫자·단위·약어 읽기를 확인할 때 씁니다.
+    바뀌는 문장만 보여 주고(all_sentences=true면 모두), 마지막에 바꾼 곳을 모아 줍니다. 틀리게 읽히는 곳은 대본에 {쓴 글|읽을 말}로
+    고치거나 reading_dictionary에 넣습니다. numbers·readings는 make_voice와 같습니다."""
+    from tts_app import reading, textproc
+
+    if text_file:
+        text = textproc.read_text_file(_file(text_file, "대본"))
+    if not text.strip():
+        raise ToolError("text나 text_file로 읽을 글을 주세요.")
+    reader = reading.reader(numbers, _readings(readings))
+    lines, changed, total, differ = [], {}, 0, 0
+    for seg in textproc.segment_text(text, lang):
+        if seg.is_pause:
+            continue
+        total += 1
+        said, changes = reader.say(seg.to_read, seg.lang)
+        changed.update(dict.fromkeys(changes))
+        differ += bool(changes)
+        if changes or all_sentences:
+            lines.append(f"{seg.line + 1}줄 {seg.text}\n    → {said}")
+    book = reading.load()
+    on = book.numbers if numbers is None else numbers
+    head = (f"{total}문장 중 {differ}문장의 읽는 법이 바뀝니다 "
+            f"(숫자 자동 읽기 {'켬' if on else '끔'}, 기본 사전 {'켬' if book.builtin else '끔'}, 내 사전 {len(book.words)}개).")  # fmt: skip
+    swaps = ", ".join(f"{a} → {b or '(읽지 않음)'}" for a, b in changed)
+    return "\n".join([head, "", *lines] + (["", "바꾼 곳: " + swaps] if swaps else []))
+
+
+@tool
+def reading_dictionary(add: dict | None = None, remove: list[str] | None = None, numbers: bool | None = None,
+                       builtin: bool | None = None, show_builtin: bool = False) -> str:  # fmt: skip
+    """읽기 사전을 보고 고칩니다: 모든 음성에서 그 글을 그렇게 읽습니다(자막은 쓴 그대로). 편집기 음성 탭의 "읽는 법 사전"과 같은 것.
+    - add: {"쓴 글": "읽을 말"} 넣기·바꾸기 (예: {"FEM": "에프이엠", "SS400": "에스에스 사백"}). 읽을 말을 ""로 두면 읽지 않고 넘어감
+    - remove: 뺄 글 목록. numbers: 숫자 자동 읽기 켜기·끄기. builtin: 기본 사전(단위·약어·그리스 문자) 쓰기·끄기
+    - show_builtin: 기본 사전 내용도 보여 줌. 같은 글이 내 사전에 있으면 내 사전이 이깁니다."""
+    from tts_app import reading
+
+    book = reading.load()
+    changed = []
+    if add:
+        words = _readings(add)
+        book.words.update(words)
+        changed.append(f"넣음 {len(words)}개")
+    for word in remove or []:
+        if book.words.pop(str(word).strip(), None) is not None:
+            changed.append(f"뺌 {word}")
+    if numbers is not None:
+        book.numbers = numbers
+        changed.append(f"숫자 자동 읽기 {'켬' if numbers else '끔'}")
+    if builtin is not None:
+        book.builtin = builtin
+        changed.append(f"기본 사전 {'켬' if builtin else '끔'}")
+    if changed:
+        reading.save(book)
+    lines = [("바꿨습니다: " + ", ".join(changed) + "\n") if changed else "",
+             f"숫자 자동 읽기: {'켬' if book.numbers else '끔'} · 기본 사전: {'켬' if book.builtin else '끔'} ({len(reading.BUILTIN)}개) · "
+             f"사전 파일: {reading.dictionary_path()}",
+             f"내 사전 {len(book.words)}개:" + ("" if book.words else " (없음)")]  # fmt: skip
+    lines += [f"  {a} → {b or '(읽지 않음)'}" for a, b in sorted(book.words.items())]
+    if show_builtin:
+        lines += ["기본 사전:"] + [f"  {a} → {b}" for a, b in sorted(reading.BUILTIN.items(), key=lambda kv: kv[0].lower())]
+    return "\n".join(line for line in lines if line)
 
 
 # ---- files --------------------------------------------------------------------------------------------
@@ -821,7 +924,8 @@ def add_scenes(project: str, scenes: list[dict], before: int = 0) -> str:
             made.append(_changed_scene(data, Scene(kind=fields.get("kind", "color")), fields))
         data.scenes[at:at] = made
         _save(path, data)
-    return f"장면 {len(made)}개를 {at + 1}번부터 넣었습니다.\n" + _summary(path, data)
+    notes = _layout_notes(data, list(range(at + 1, at + len(made) + 1)))
+    return _with_notes(f"장면 {len(made)}개를 {at + 1}번부터 넣었습니다.\n" + _summary(path, data), notes)
 
 
 @tool
@@ -836,7 +940,7 @@ def update_scene(project: str, scene: int | list[int], fields: dict) -> str:
             index = _number(current, number)
             current.scenes[index] = _changed_scene(current, current.scenes[index], data)
         _save(path, current)
-    return _summary(path, current)
+    return _with_notes(_summary(path, current), _layout_notes(current, [_number(current, n) + 1 for n in numbers]))
 
 
 @tool
@@ -933,20 +1037,113 @@ def _frame(project: Project, at: float, scene: int) -> tuple[int, float, object]
     return index, moment, image
 
 
+def _cues(project: Project) -> list[Cue]:
+    """The subtitles the finished video gets: edited in the timeline, or the voice's subtitle file (none without a voice)."""
+    if not project.voice:
+        return []
+    if project.cues is not None:
+        return project.cues
+    voice = Path(project.voice) if Path(project.voice).is_absolute() else work_dir() / project.voice
+    srt = next((voice.with_suffix(s) for s in subs.SUBTITLE_SUFFIXES if voice.with_suffix(s).exists()), None)
+    try:
+        return subs.load_cues(srt) if srt else []
+    except (OSError, ValueError):
+        return []
+
+
+def _said_at(cues: list[Cue], at: float) -> str | None:
+    return next((cue.text for cue in cues if cue.start <= at < cue.end), None)
+
+
+def _subtitled(images: list[QImage], texts: list[str | None], style: SubStyle) -> list[QImage]:
+    """The pictures with texts[k] drawn on picture k as the render burns subtitles in (libass, one run of FFmpeg)."""
+    if not any(texts):
+        return images
+    with tempfile.TemporaryDirectory(prefix="movie_mcp_") as tmp:
+        folder = Path(tmp)
+        for k, image in enumerate(images):
+            image.save(str(folder / f"still{k:03d}.bmp"))
+        made = render.subtitle_stills(folder, texts, style, images[0].width(), images[0].height())
+        return [QImage(str(path)).convertToFormat(QImage.Format.Format_RGB32) for path in made]
+
+
+@functools.lru_cache(maxsize=32)
+def _band_of(text: str, style_json: str, width: int, height: int) -> tuple[float, float, float, float] | None:
+    """Where the subtitle `text` goes (left, top, right, bottom as shares of the frame): drawn on a grey frame and found."""
+    grey = QImage(width, height, QImage.Format.Format_RGB32)
+    grey.fill(0xFF808080)
+    try:
+        drawn = _subtitled([grey], [text], SubStyle(**json.loads(style_json)))[0]
+    except (OSError, RuntimeError):
+        return None
+    pixels = np.frombuffer(drawn.constBits(), np.uint8).reshape(height, drawn.bytesPerLine() // 4, 4)[:, :width, :3]
+    drawn_on = (np.abs(pixels.astype(np.int16) - 128) > 24).any(axis=2)
+    rows, cols = np.flatnonzero(drawn_on.any(axis=1)), np.flatnonzero(drawn_on.any(axis=0))
+    if not rows.size:
+        return None
+    pad = 0.005
+    return (max(0.0, float(cols[0]) / width - pad), max(0.0, float(rows[0]) / height - pad),
+            min(1.0, float(cols[-1] + 1) / width + pad), min(1.0, float(rows[-1] + 1) / height + pad))  # fmt: skip
+
+
+def _subtitle_band(project: Project, style: SubStyle, cues: list[Cue]) -> tuple[float, float, float, float] | None:
+    """Where burnt-in subtitles go (left, top, right, bottom as shares of the frame), from the line taking most room."""
+    if not cues:
+        return None
+    longest = max(cues, key=lambda cue: (cue.text.count("\n"), len(cue.text))).text
+    width, height = project.size
+    return _band_of(longest, json.dumps(dataclasses.asdict(style), sort_keys=True), width, height)
+
+
+def _layout_notes(project: Project, numbers: list[int], style: SubStyle | None = None, burn: bool = True) -> list[str]:
+    """Layers of these graphic scenes (numbered from 1) that stay off the frame, or under the burnt-in subtitles while
+    the voice speaks over the scene, in words."""
+    cues = _cues(project) if burn else []
+    band = _subtitle_band(project, style or _saved_style({}), cues)
+    width, height = project.size
+    notes = []
+    for number in numbers:
+        index = number - 1
+        scene = project.scenes[index]
+        if scene.kind != "graphic" or not scene.layers:
+            continue
+        start = sum(s.duration for s in project.scenes[:index])
+        spoken = band if any(cue.start < start + scene.duration and cue.end > start for cue in cues) else None
+        last = max(0.0, scene.duration - 1 / project.frame_rate)
+        times = [last * k / (LAYOUT_SAMPLES - 1) for k in range(LAYOUT_SAMPLES)]
+        notes += [f"{number}번 장면 {problem}" for problem in
+                  graphics.layout_problems(scene.layers, scene.style, width, height, scene.duration, times, spoken)]  # fmt: skip
+    return notes
+
+
+def _with_notes(text: str, notes: list[str]) -> str:
+    if not notes:
+        return text
+    return text + "\n\n확인할 곳 (그려 보니; 자막 자리는 자막을 영상에 입힐 때):\n" + "\n".join(f"- {note}" for note in notes)
+
+
 @tool
-def preview_frame(project: str, at: float = 0.0, scene: int = 0, width: int = PREVIEW_WIDTH) -> list:
-    """영상의 한 순간을 그림으로 보여 줍니다(결과와 같은 방식으로 그림: 글자, 겹치기, 가리기, 보정, 로고 포함. 장면 전환과
-    처음·끝 페이드, 자막은 빠짐). at: 영상 시작부터 초. scene을 주면 at은 그 장면 시작부터 초. width: 돌려줄 그림의 가로 크기."""
+def preview_frame(project: str, at: float = 0.0, scene: int = 0, width: int = PREVIEW_WIDTH, subtitles: bool = True,
+                  subtitle_style: dict | None = None) -> list:  # fmt: skip
+    """영상의 한 순간을 그림으로 보여 줍니다(결과와 같은 방식으로 그림: 글자, 겹치기, 가리기, 보정, 로고, 그리고 그때의 자막을
+    render_video처럼 입힘. 장면 전환과 처음·끝 페이드는 빠짐). at: 영상 시작부터 초. scene을 주면 at은 그 장면 시작부터 초.
+    width: 돌려줄 그림의 가로 크기. subtitles: false면 자막 없이. subtitle_style: render_video와 같은 자막 모양 바꾸기.
+    그래픽 장면이면 화면 밖으로 나가거나 자막 자리에 겹치는 레이어도 글로 알려 줍니다."""
     _path_, data = _load(project)
     index, moment, image = _frame(data, at, scene)
+    start = sum(s.duration for s in data.scenes[:index])
+    style = _saved_style(subtitle_style or {})
+    cues = _cues(data) if subtitles else []
+    said = _said_at(cues, start + moment)
+    if said:
+        image = _subtitled([image], [said], style)[0]
     width = min(max(160, width), image.width())
     image = image.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
-    buffer = QBuffer()
-    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-    image.save(buffer, "JPG", 85)
-    start = sum(s.duration for s in data.scenes[:index])
     caption = f"{index + 1}번 장면 {moment:.2f}초째 (영상 {start + moment:.2f}초) · {image.width()}×{image.height()}로 줄임"
-    return [Image(data=bytes(buffer.data()), format="jpeg"), caption]
+    band = _subtitle_band(data, style, cues)
+    if band:
+        caption += f"\n자막 자리: 세로 {band[1]:.2f}–{band[3]:.2f}" + (f' · 지금 자막 "{_short(said, 50)}"' if said else " · 지금은 자막 없음")
+    return [_jpeg(image), _with_notes(caption, _layout_notes(data, [index + 1], style, subtitles))]
 
 
 @tool
@@ -1067,8 +1264,11 @@ def style_sheet(name: str = "", width: int = 1280) -> list:
 
 
 @tool
-def preview_frames(project: str, scene: int, count: int = 6, width: int = 1600) -> list:
-    """한 장면의 여러 순간(처음부터 끝까지 고르게 count개)을 한 장의 그림으로 보여 줍니다. 나타남·움직임을 확인할 때 씁니다."""
+def preview_frames(project: str, scene: int, count: int = 6, width: int = 1600, subtitles: bool = True,
+                   subtitle_style: dict | None = None) -> list:  # fmt: skip
+    """한 장면의 여러 순간(처음부터 끝까지 고르게 count개)을 한 장의 그림으로 보여 줍니다. 나타남·움직임을 확인할 때 씁니다.
+    그때그때의 자막도 render_video처럼 입힙니다(subtitles: false면 빼고, subtitle_style로 모양 바꾸기). 그래픽 장면이면
+    화면 밖으로 나가거나 자막 자리에 겹치는 레이어도 글로 알려 줍니다."""
     _path_, data = _load(project)
     index = _number(data, scene)
     item = data.scenes[index]
@@ -1078,21 +1278,29 @@ def preview_frames(project: str, scene: int, count: int = 6, width: int = 1600) 
     frame_w, frame_h = data.size
     cell_w = max(160, min(width, 2400) // columns)
     cell_h = round(cell_w * frame_h / frame_w)
-    sheet = QImage(cell_w * columns, (cell_h + 28) * rows, QImage.Format.Format_RGB32)
-    sheet.fill(Qt.GlobalColor.black)
-    painter = QPainter(sheet)
     last = max(0.0, item.duration - 1 / data.frame_rate)
     logo = canvas.logo_layer(data, frame_w, frame_h)
     times = [last * k / (count - 1) for k in range(count)]
-    for k, at in enumerate(times):
-        picture = scene_render.still(item, frame_w, frame_h, at, logo)
+    pictures = [scene_render.still(item, frame_w, frame_h, at, logo) for at in times]
+    start = sum(s.duration for s in data.scenes[:index])
+    style = _saved_style(subtitle_style or {})
+    cues = _cues(data) if subtitles else []
+    pictures = _subtitled(pictures, [_said_at(cues, start + at) for at in times], style)
+    sheet = QImage(cell_w * columns, (cell_h + 28) * rows, QImage.Format.Format_RGB32)
+    sheet.fill(Qt.GlobalColor.black)
+    painter = QPainter(sheet)
+    for k, (at, picture) in enumerate(zip(times, pictures)):
         x, y = (k % columns) * cell_w, (k // columns) * (cell_h + 28)
         painter.drawImage(x, y, picture.scaled(cell_w, cell_h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation))
         painter.setPen(Qt.GlobalColor.white)
         painter.drawText(x + 8, y + cell_h + 20, f"{at:.2f}초")
     painter.end()
     note = " (장면 글자 texts의 나타남 효과는 정지 화면에서 빠짐; 그래픽 레이어는 그대로)" if item.texts else ""
-    return [_jpeg(sheet), f"{scene}번 장면, {', '.join(f'{t:.2f}' for t in times)}초{note}"]
+    caption = f"{scene}번 장면, {', '.join(f'{t:.2f}' for t in times)}초{note}"
+    band = _subtitle_band(data, style, cues)
+    if band:
+        caption += f"\n자막 자리: 세로 {band[1]:.2f}–{band[3]:.2f}"
+    return [_jpeg(sheet), _with_notes(caption, _layout_notes(data, [index + 1], style, subtitles))]
 
 
 # ---- templates ---------------------------------------------------------------------------------------------
@@ -1179,13 +1387,13 @@ def apply_template(project: str, template: str, params: dict | None = None, scen
             old = data.scenes[index]
             data.scenes[index] = dataclasses.replace(old, kind="graphic", style=style, layers=filled["layers"], source="",
                                                      duration=duration or old.duration)  # fmt: skip
-            where = f"{scene}번 장면을 바꿨습니다"
+            where, number = f"{scene}번 장면을 바꿨습니다", index + 1
         else:
             at = len(data.scenes) if before == 0 else _number(data, before)
             data.scenes.insert(at, Scene(kind="graphic", style=style, layers=filled["layers"], duration=duration or filled["duration"]))
-            where = f"{at + 1}번에 넣었습니다"
+            where, number = f"{at + 1}번에 넣었습니다", at + 1
         _save(path, data)
-    return f"템플릿 '{template}'으로 {where}.\n" + _summary(path, data)
+    return _with_notes(f"템플릿 '{template}'으로 {where}.\n" + _summary(path, data), _layout_notes(data, [number]))
 
 
 @tool
@@ -1257,7 +1465,8 @@ def storyboard_to_project(file: str, project: str, sheet: str = "", columns: dic
     board = _board(file, sheet, columns)
     made, notes = storyboard.build(board, from_dict(Project, settings), _file(voice, "음성") if voice else None)
     _save(path, made)
-    return "\n".join([*notes, "", _summary(path, made)]).strip()
+    text = "\n".join([*notes, "", _summary(path, made)]).strip()
+    return _with_notes(text, _layout_notes(made, list(range(1, len(made.scenes) + 1))))
 
 
 @tool

@@ -291,6 +291,15 @@ def sample_ass(text: str, style: SubStyle, width: int, height: int) -> str:
     return _styled(subs, style, width, height, animate=False)
 
 
+def stills_ass(texts: list[str | None], style: SubStyle, width: int, height: int) -> str:
+    """Line k shown from second k to k + 1, for drawing texts[k] onto still k of stills played one a second."""
+    subs = pysubs2.SSAFile()
+    for k, text in enumerate(texts):
+        if text:
+            subs.append(pysubs2.SSAEvent(start=k * 1000, end=(k + 1) * 1000, text=_escape(text)))
+    return _styled(subs, style, width, height, animate=False)
+
+
 def _timestamp(seconds: float) -> str:
     ms = max(0, round(seconds * 1000))
     h, ms = divmod(ms, 3_600_000)

@@ -53,6 +53,11 @@
 음성 모델은 이 탭을 처음 열 때 불러옵니다(몇 초). 영상 작업만 할 때는 불러오지 않습니다.
 
 - **쉼 넣기**: 글 중간에 `[쉼 2초]`를 쓰면 그 자리에 정확히 2초 쉽니다(`[쉼]`은 1초, 최대 60초, `[pause 2s]`도 됨). 쉼 표시는 자막에 나오지 않습니다.
+- **읽는 법** (자막은 쓴 그대로, 소리만 바뀜)
+  - **숫자 자동 읽기**(기본 켬): 한국어 문장의 숫자를 뒤에 오는 말에 맞춰 읽습니다. 14개 → 열네 개, 3시 30분 → 세 시 삼십 분, 2024년 6월 → 이천이십사 년 유월, 1번째 → 첫 번째, 182 MPa → 백팔십이 메가파스칼, 1.37 → 일 점 삼칠, 15% → 십오 퍼센트, 3~5개 → 세 개에서 다섯 개, 60km/h → 시속 육십 킬로미터, 2024.10.30 → 이천이십사 년 시월 삼십 일. A4·MP3처럼 정할 수 없는 것은 그대로 둡니다. **읽는 법 ▾ → 숫자 자동 읽기**로 끕니다.
+  - **고른 글 읽는 법 지정**(Ctrl+R, 또는 오른쪽 클릭): 글을 드래그해서 고르고 읽기를 적습니다(숫자 규칙대로 읽은 것을 먼저 채워 줌). **이 자리만**이면 대본에 `{14번|열네 번}`처럼 표시되고(초록색), **사전에 넣기**면 모든 대본에서 그렇게 읽습니다. 표시 안에 커서를 두고 다시 누르면 고치거나 **표시 지우기**. 읽기를 비우면 그 글은 읽지 않고 넘어갑니다. 대본에 `{글|읽기}`를 직접 써도 됩니다.
+  - **읽는 법 사전**: 내 사전(글 → 읽기)을 더하고 지우고, 숫자 자동 읽기와 **기본 사전**(단위 MPa·mm·Hz·℃…, 약어 CAE·FEM·CFD·3D…, 그리스 문자 σ·ε·Δ…)을 켜고 끄며, 아래 칸에서 바로 시험해 봅니다. 내 사전이 숫자 규칙과 기본 사전보다 먼저입니다. 데이터 폴더의 `읽기사전.json`에 저장되고 Claude(MCP)·명령줄도 같은 사전을 씁니다.
+  - **실제로 읽을 글 보기**: 문장마다 바뀌는 곳(14개 → 열네 개 …)을 모아 보여 줍니다.
 - **줄마다 걸리는 시간**: 글이나 설정을 바꾸면 바로 다시 계산합니다. Supertonic은 예상이 실제와 같고, MeloTTS는 2% 안팎 차이가 납니다.
 - **목소리 만들기**: 두 목소리를 비율대로 섞어 저장하거나(목록에 ★), Supertonic 3용 목소리 파일(`.json`)을 가져옵니다. `voices` 폴더에 저장됩니다.
 - **MeloTTS**: 한국어 전용입니다. 처음 고르면 5–15초 동안 불러옵니다. "품질" 설정은 쓰이지 않습니다.
@@ -213,15 +218,16 @@
 > 이 대본으로 세로 쇼츠 만들어 줘. 장면마다 `D:\사진`의 이미지를 차례로 넣고, 첫 장면에 제목 "오늘의 소식"을 크게, 유튜브 음량에 맞춰서.
 
 Claude는 보통 이 순서로 도구를 씁니다.
-1. **make_voice**: 대본을 음성(MP3)과 자막(SRT)으로 만듭니다(목소리는 **list_voices**).
+1. **make_voice**: 대본을 음성(MP3)과 자막(SRT)으로 만듭니다(목소리는 **list_voices**). 숫자·단위·약어를 ① 탭과 같이 읽고, 결과에 "읽는 법을 바꾼 곳"을 알려 줍니다. **preview_reading**으로 음성 없이 읽을 글을 미리 보고, **reading_dictionary**로 읽기 사전을 보고 고칩니다. 이 음성에서만 쓸 말은 `readings`, 숫자 읽기는 `numbers`.
 2. **new_project**: 음성의 문장마다 빈 장면을 만들고 길이를 문장에 맞춥니다.
 3. **fill_scenes**·**update_scene**·**add_scenes**: 그림·영상·글자·겹치기·가리기·키프레임·보정을 넣습니다. **update_project**로 화면 비율, fps, 전환, 페이드, 배경 음악, 로고, 효과음을 정합니다.
-4. **preview_frame**: 원하는 순간의 화면을 그림으로 보고 확인합니다(결과와 같은 방식으로 그림). **export_frame**은 원본 크기 썸네일을 저장합니다.
+4. **preview_frame**: 원하는 순간의 화면을 그림으로 보고 확인합니다(결과와 같은 방식으로 그림). 그때의 자막도 최종 영상과 똑같이 입혀 보여 주고, 자막 자리(세로 범위)를 알려 줍니다. **export_frame**은 원본 크기 썸네일을 저장합니다(자막 없음).
 5. **render_video**: 장면 + 음성 + 자막 + 음악 + 효과음을 넣은 최종 영상을 만듭니다. 형식(MP4, H.265, MOV, MKV, WebM, GIF, MP3, WAV)과 음량 맞추기를 고를 수 있고, 자막 모양은 ③ 탭에 저장된 모양을 씁니다.
 
 설명 그림은 **그래픽 장면**(kind "graphic")으로 만듭니다. Claude는 직접 그리기 코드(Pillow, MoviePy 등)를 짜지 않고 이 도구의 레이어와 스타일로 만들도록 안내받습니다.
 - **graphic_guide**: 레이어 종류·항목·나타남·시간 함수 설명. **list_styles**·**get_style**·**style_sheet**(스타일 한 장 그림): 있는 스타일 보기. **save_style**·**delete_style**: 스타일 만들기·고치기·지우기.
-- **preview_frames**: 한 장면의 여러 순간을 한 장으로 보여 줘서, 나타남·움직임을 Claude가 직접 확인합니다.
+- **preview_frames**: 한 장면의 여러 순간을 한 장으로 보여 줘서(자막 포함), 나타남·움직임을 Claude가 직접 확인합니다.
+- 그래픽 장면을 넣거나 고치면(update_scene, add_scenes, apply_template, storyboard_to_project) 레이어를 하나씩 그려 보고, 자리를 잡은 뒤에도 **화면 밖으로 나가는 레이어**(잘리는 글자, 넘치는 범례 등)와 **자막 자리에 겹치는 글자·그림**을 "확인할 곳"으로 알려 줍니다(얼마나 나갔는지, 그려지는 범위까지). 밖에서 밀려 들어오거나 움직여 지나가는 것은 알리지 않습니다.
 - **list_plugins**: 플러그인 목록과 새 플러그인 만드는 법. 레이어로 안 되는 그림은 ① 플러그인(없으면 Claude Code가 플러그인 폴더에 만들어 두고 계속 씀) ② 코드로 만든 PNG 묶음·투명 영상을 frames·video 레이어로 넣기, 순서로 하도록 안내되어 있습니다.
 - 기존에 쓰던 스타일을 옮길 때는, 색(#rrggbb)·글꼴·배경·자주 쓰는 소품 모양을 알려 주면 Claude가 save_style로 스타일 파일을 만듭니다.
 
@@ -236,6 +242,26 @@ Claude는 보통 이 순서로 도구를 씁니다.
   - 다시 등록: `claude mcp add --scope user movie-editor -- "<폴더>\.venv\Scripts\python.exe" "<폴더>\mcp_server.py"` / 빼기: `claude mcp remove movie-editor -s user`
   - **exe 버전**은 같은 폴더의 `movie-mcp.exe`가 MCP 서버입니다: `claude mcp add --scope user movie-editor -- "<exe 폴더>\movie-mcp.exe"`, Claude Desktop 설정에는 `"command": "<exe 폴더>\\movie-mcp.exe"`(JSON이라 역슬래시 두 개, args 없음)로 넣습니다. 프로그램을 쓰지 않을 때도 Claude가 알아서 켜고 끕니다.
 
+### Codex에서 쓰기
+
+같은 MCP 서버를 OpenAI **Codex**(앱·CLI)에도 연결해 두었습니다(`%USERPROFILE%\.codex\config.toml`의 `[mcp_servers.movie-editor]`).
+- 다시 등록: `codex mcp add movie-editor -- "<폴더>\.venv\Scripts\python.exe" "<폴더>\mcp_server.py"` / 빼기: `codex mcp remove movie-editor`. exe 버전은 `-- "<exe 폴더>\movie-mcp.exe"`.
+- Codex 기본값은 서버 시작 10초·도구 응답 60초까지 기다리므로, 등록한 항목 아래에 `startup_timeout_sec = 60`, `tool_timeout_sec = 900`을 넣어 둡니다(음성·영상 만들기를 오래 기다려도 끊기지 않게).
+- Codex는 MCP 도구를 숨겨 두었다가 검색해서 씁니다. "movie-editor로 …"처럼 서버 이름을 말하면 잘 찾습니다. 도구를 처음 쓸 때 Codex가 승인을 묻습니다. 묻지 않게 하려면 항목에 `default_tools_approval_mode = "approve"`를 넣습니다.
+- 설정을 바꾼 뒤에는 Codex 앱을 다시 켜거나 새 대화에서 써야 불러옵니다.
+
+### Gemini에서 쓰기 (Antigravity)
+
+같은 MCP 서버를 Google의 **Antigravity**(CLI `agy`, IDE, 앱)에도 연결할 수 있습니다. 개인 Google 계정(무료·AI Pro·Ultra)용 Gemini CLI는 2026년 6월 18일에 서비스가 끝났고, Antigravity가 그 뒤를 잇습니다(Gemini CLI는 유료 API 키나 회사·학교(Standard·Enterprise) 계정에서만 계속 됩니다).
+- 전역 설정 `%USERPROFILE%\.gemini\config\mcp_config.json`에 넣습니다(이 PC에는 등록해 두었습니다):
+  ```json
+  {"mcpServers": {"movie-editor": {"command": "<폴더>\.venv\Scripts\python.exe", "args": ["<폴더>\mcp_server.py"]}}}
+  ```
+  exe 버전은 `"command": "<exe 폴더>\movie-mcp.exe"`만 적습니다(args 없음). 한 작업 폴더에서만 쓰려면 그 폴더의 `.agents\mcp_config.json`에 같은 내용을 넣습니다.
+- Antigravity에서 `/mcp list`로 `movie-editor`가 보이는지 확인합니다. 작업 폴더를 믿을지 물으면 허용해야 MCP 서버가 켜집니다.
+- 서버 안내문을 읽지 않는 클라이언트를 위해 **usage_guide** 도구가 같은 사용 순서를 돌려줍니다. 처음에 "movie-editor의 usage_guide를 먼저 읽고 해 줘"라고 하면 됩니다.
+- Gemini CLI(유료 API 키 등)에서는 `gemini mcp add --scope user movie-editor "<폴더>\.venv\Scripts\python.exe" "<폴더>\mcp_server.py"`로 등록합니다(`%USERPROFILE%\.gemini\settings.json`).
+
 ## 명령줄
 
 ```bat
@@ -246,6 +272,7 @@ Claude는 보통 이 순서로 도구를 씁니다.
 
 :: 음성 만들기 (① 탭과 같은 기능)
 .venv\Scripts\python tts_cli.py 원고.txt --srt                    :: 원고.mp3 + 원고.srt
+.venv\Scripts\python tts_cli.py 원고.txt --reading FEM=에프이엠 --numbers off   :: 이번만 쓰는 읽기, 숫자 자동 읽기 끄기
 .venv\Scripts\python tts_cli.py --list-voices
 ```
 
@@ -256,7 +283,7 @@ Claude는 보통 이 순서로 도구를 씁니다.
 | `app.py`, `run.bat`, `setup.bat` | 실행과 설치 |
 | `build.py`, `movie.spec`, `requirements-build.txt` | exe 버전 만들기 (PyInstaller) |
 | `cli.py`, `tts_cli.py` | 명령줄 (합성, 음성 만들기) |
-| `mcp_server.py`, `movie_app/mcp_server.py` | Claude Code·Desktop용 MCP 서버 (도구 목록과 작업 기다리기) |
+| `mcp_server.py`, `movie_app/mcp_server.py` | Claude Code·Desktop·Codex·Antigravity용 MCP 서버 (도구 목록과 작업 기다리기) |
 | `movie_app/main_window.py` | 탭 세 개를 담는 창, 탭 사이 넘겨주기, 공통 화면 스타일 |
 | `movie_app/scene_page.py` | ② 영상 만들기 탭 (실행 취소, 여러 장면 고르기, 단축키, 자막 고치기) |
 | `movie_app/scene_panels.py`, `movie_app/scene_screen.py` | ② 탭의 글자·겹치기·가리기·보정·전체 설정 칸, 글자·그림·가리기 상자를 끌어 옮기는 미리보기 |
@@ -274,7 +301,7 @@ Claude는 보통 이 순서로 도구를 씁니다.
 | `movie_app/compose_page.py` | ③ 합성 탭 |
 | `movie_app/render.py`, `media.py`, `subs.py` | 합성 명령 만들기, 영상 정보 조회(ffprobe), 자막 읽기와 ASS 스타일 |
 | `movie_app/ffmpeg.py`, `widgets.py`, `paths.py` | FFmpeg 실행(진행률·취소), 공통 화면 부품, 파일 위치 |
-| `tts_app/` | ① 음성 만들기 탭과 음성 엔진 (Supertonic, MeloTTS) |
+| `tts_app/` | ① 음성 만들기 탭과 음성 엔진 (Supertonic, MeloTTS). `reading.py`: 읽는 법(숫자 규칙, `{글\|읽기}` 표시, 읽기 사전) |
 | `models/`, `voices/` | 음성 모델, 내가 만든 목소리 |
 | `tools/ffmpeg/`, `tools/get_ffmpeg.py` | FFmpeg와 내려받는 스크립트 |
 | `작업/` | 탭 사이에 넘긴 음성·자막·장면 영상, 장면 캐시, 미리보기, 자동 저장(`마지막 장면.json`, `대본.txt`, 지우면 다음 실행 때 빈 상태로 시작)과 그 기록(`자동저장`), Claude(MCP)가 만든 것(`MCP`, `장면캐시_MCP`) |
@@ -282,10 +309,11 @@ Claude는 보통 이 순서로 도구를 씁니다.
 | `스타일/` | 내가 만든 그래픽 스타일 (JSON, SVG 소품) |
 | `플러그인/` | 내가 만든 그래픽 플러그인 (파이썬 파일 하나 = 레이어 종류 하나) |
 | `템플릿/` | 내가 만든 장면 템플릿 (JSON) |
+| `읽기사전.json` | 읽는 법 사전 (내 사전, 숫자 자동 읽기·기본 사전 켜기) |
 | `settings.ini`, `error.log` | 설정(탭별 구역 `[tts]`, `[scenes]`, `[compose]`, 공통 `gpu`), 오류 기록 |
 
 ## 알아 둘 점
 
-- 숫자, 영어 약어, 특수기호를 어색하게 읽으면 글에서 한글로 풀어 쓰세요(예: `3,500원` → `삼천오백 원`).
+- 숫자·약어를 어색하게 읽으면 그 글을 골라 **읽는 법 지정**(Ctrl+R)으로 고치거나 읽는 법 사전에 넣으세요. 자막은 쓴 그대로 남습니다.
 - 오류가 나면 `error.log`에 자세한 내용이 남습니다.
 - 라이선스: 개인 용도로는 문제없습니다. 배포할 일이 생기면 Supertonic(OpenRAIL-M/MIT), MeloTTS(MIT), pedalboard(GPLv3), FFmpeg(GPL) 라이선스를 확인하세요.

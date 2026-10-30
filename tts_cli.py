@@ -55,6 +55,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--paragraph-pause", type=float, default=pipeline.Settings.paragraph_pause)
     parser.add_argument("--srt", action="store_true", help="자막(SRT)도 저장")
     parser.add_argument("--srt-line", type=int, default=30, help="자막 한 줄 최대 글자 수")
+    parser.add_argument("--numbers", choices=["on", "off"], help="숫자 자동 읽기 (14개 → 열네 개). 기본: 읽기 사전 설정대로")
+    parser.add_argument("--reading", action="append", default=[], metavar="글=읽기",
+                        help="이번에만 다르게 읽을 말, 예: --reading FEM=에프이엠 (여러 번 쓸 수 있음). 자막은 쓴 그대로")
     args = parser.parse_args(argv)
     sys.stdout.reconfigure(errors="replace")
 
@@ -69,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("TXT 파일이나 --text 를 지정하세요.")
     if not MIN_SPEED <= args.speed <= MAX_SPEED:
         parser.error(f"--speed 는 {MIN_SPEED}에서 {MAX_SPEED} 사이여야 합니다.")
+    readings = {}
+    for item in args.reading:
+        written, sep, said = item.partition("=")
+        if not sep or not written.strip():
+            parser.error(f"--reading 은 글=읽기 모양이어야 합니다 (받은 값: {item})")
+        readings[written.strip()] = said.strip()
 
     settings = pipeline.Settings(
         voice=voice,
@@ -79,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         steps=args.steps,
         sentence_pause=args.sentence_pause,
         paragraph_pause=args.paragraph_pause,
+        numbers=None if args.numbers is None else args.numbers == "on",
+        readings=readings,
     )
     jobs = [(None, args.text)] if args.text is not None else [(Path(p), None) for p in args.inputs]
 

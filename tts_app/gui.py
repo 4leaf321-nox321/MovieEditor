@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,10 +35,11 @@ from PySide6.QtWidgets import (
 
 from movie_app import autosave
 
-from . import paths, pipeline, subtitles, textproc
+from . import paths, pipeline, reading, subtitles, textproc
 from .editor import TextEditor, format_length
 from .engine import MAX_SPEED, MELO_VOICE, MIN_SPEED, Engine, list_voices
 from .player import Player
+from .reading_dialog import DictionaryDialog, ReadingDialog, ReadingsDialog
 from .voice_dialog import VoiceDialog
 
 APP_TITLE = "동영상 편집기"
@@ -230,7 +231,8 @@ class TtsPage(QWidget):
         self.tick_timer.timeout.connect(self._tick)
         self.tick_timer.start()
 
-        for keys, slot in (("Ctrl+O", self.open_file), ("Ctrl+S", self.save), ("Ctrl+Return", self.generate)):
+        for keys, slot in (("Ctrl+O", self.open_file), ("Ctrl+S", self.save), ("Ctrl+Return", self.generate),
+                           ("Ctrl+R", self.set_reading)):  # fmt: skip
             QShortcut(QKeySequence(keys), self).activated.connect(slot)
 
         self._update_counts()
@@ -270,11 +272,28 @@ class TtsPage(QWidget):
         for seconds in (0.5, 1, 2, 3, 5):
             pause_menu.addAction(f"{seconds:g}초", lambda s=seconds: self.insert_pause(s))
         pause_btn.setMenu(pause_menu)
+        reading_btn = QToolButton()
+        reading_btn.setText("읽는 법 ▾")
+        reading_btn.setToolTip("드래그해서 고른 글을 다르게 읽게 합니다(자막은 쓴 그대로). 예: 14번 → 열네 번.\n"
+                               "대본에 {14번|열네 번}처럼 써도 되고, 자주 쓰는 말은 읽는 법 사전에 넣습니다.")  # fmt: skip
+        reading_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        reading_menu = QMenu(reading_btn)
+        reading_menu.addAction("고른 글 읽는 법 지정…\tCtrl+R", self.set_reading)
+        reading_menu.addAction("읽는 법 사전…", self.edit_dictionary)
+        reading_menu.addAction("실제로 읽을 글 보기…", self.show_readings)
+        reading_menu.addSeparator()
+        self.numbers_action = reading_menu.addAction("숫자 자동 읽기 (14개 → 열네 개)")
+        self.numbers_action.setCheckable(True)
+        self.numbers_action.setChecked(reading.load().numbers)
+        self.numbers_action.toggled.connect(self._set_numbers)
+        reading_menu.aboutToShow.connect(self._sync_numbers)
+        reading_btn.setMenu(reading_menu)
         self.count_label = QLabel()
         self.count_label.setObjectName("muted")
         bar.addWidget(open_btn)
         bar.addWidget(clear_btn)
         bar.addWidget(pause_btn)
+        bar.addWidget(reading_btn)
         bar.addStretch(1)
         bar.addWidget(self.count_label)
         left.addLayout(bar)
@@ -284,10 +303,14 @@ class TtsPage(QWidget):
             "여기에 읽을 글을 입력하거나 붙여넣으세요.\n"
             "TXT 파일을 끌어다 놓아도 됩니다.\n\n"
             "줄바꿈은 문장 구분, 빈 줄은 문단 구분(조금 더 길게 쉼)으로 처리됩니다.\n"
-            "[쉼 2초]처럼 쓰면 그 자리에서 정확히 2초 쉽니다.\n\n"
+            "[쉼 2초]처럼 쓰면 그 자리에서 정확히 2초 쉽니다.\n"
+            "{14번|열네 번}처럼 쓰면 자막은 14번, 소리는 열네 번이 됩니다(글을 고르고 읽는 법 ▾).\n\n"
             "오른쪽에 줄마다 읽는 데 걸리는 시간이 나옵니다."
         )
         self.editor.fileDropped.connect(self.open_file)
+        set_reading = QAction("읽는 법 지정…", self.editor)
+        set_reading.triggered.connect(self.set_reading)
+        self.editor.context_actions = [set_reading]
         left.addWidget(self.editor, 1)
         body.addLayout(left, 1)
 
@@ -902,7 +925,7 @@ class TtsPage(QWidget):
 
     def _update_counts(self) -> None:
         text = self.editor.toPlainText()
-        spoken = textproc.PAUSE_MARK.sub("", text)
+        spoken = textproc.PAUSE_MARK.sub("", reading.written(text))
         self._counts = (len(spoken) - spoken.count("\n"), textproc.count_sentences(self._segments(text)))
         self._refresh_count_label()
 
@@ -918,7 +941,7 @@ class TtsPage(QWidget):
 
     def _timing_key(self) -> tuple:
         st = self.current_settings()
-        return (self.editor.toPlainText(), st.voice, st.lang, st.speed, st.sentence_pause, st.paragraph_pause)
+        return (self.editor.toPlainText(), st.voice, st.lang, st.speed, st.sentence_pause, st.paragraph_pause, reading.stamp())
 
     def _current_timeline(self) -> tuple[pipeline.Timeline | None, bool]:
         """The generated audio's timing if it matches the text and settings, else the latest prediction."""
@@ -965,6 +988,75 @@ class TtsPage(QWidget):
     def insert_pause(self, seconds: float) -> None:
         self.editor.insertPlainText(f"[쉼 {seconds:g}초]")
         self.editor.setFocus()
+
+    # ---- how it is read --------------------------------------------------------
+
+    def set_reading(self) -> None:
+        """How to read the selected words (or the {written|said} mark the cursor is in): there only, or everywhere."""
+        cursor = self.editor.textCursor()
+        block = self.editor.document().findBlock(cursor.selectionStart())
+        if block != self.editor.document().findBlock(cursor.selectionEnd()):
+            self._show_status("읽는 법은 한 줄 안에서 고른 글에만 정할 수 있습니다.")
+            return
+        line = block.text()
+        start, end = cursor.selectionStart() - block.position(), cursor.selectionEnd() - block.position()
+        inside = next((m for m in reading.READING_MARK.finditer(line) if m.start() <= start and end <= m.end()
+                       and (start < m.end() or start == end and m.start() < start)), None)  # fmt: skip
+        if inside is not None:
+            span, written, said = (inside.start(), inside.end()), inside.group(1), inside.group(2)
+        else:
+            written = line[start:end]
+            start, end = start + len(written) - len(written.lstrip()), end - len(written) + len(written.rstrip())
+            written = written.strip()  # a space dragged along at either end stays outside the mark
+            if not written:
+                self._show_status("읽는 법을 바꿀 글을 먼저 드래그해서 고르세요 (예: 14번).")
+                return
+            if any(ch in written for ch in "{}|") or any(m.start() < end and start < m.end() for m in reading.READING_MARK.finditer(line)):
+                self._show_status("읽는 법 표시({글|읽기})의 일부만 고를 수는 없습니다. 표시 전체나 그 안을 고르세요.")
+                return
+            span = (start, end)
+            said, changes = reading.reader(numbers=True).say(written, "ko")
+            said = said if changes else written
+        dialog = ReadingDialog(written, said, inside is not None, self)
+        if dialog.exec() != ReadingDialog.DialogCode.Accepted:
+            return
+        if dialog.removed:
+            replacement = written
+        elif dialog.everywhere.isChecked():
+            book = reading.load()
+            book.words[written] = dialog.said()
+            reading.save(book)
+            replacement = written
+            self._show_status(f"읽는 법 사전에 넣었습니다: {written} → {dialog.said() or '(읽지 않음)'}")
+            self._timing_changed()
+        else:
+            replacement = reading.mark(written, dialog.said())
+        edit = QTextCursor(block)
+        edit.setPosition(block.position() + span[0])
+        edit.setPosition(block.position() + span[1], QTextCursor.MoveMode.KeepAnchor)
+        if edit.selectedText() != replacement:
+            edit.insertText(replacement)  # one step to undo
+        self.editor.setFocus()
+
+    def edit_dictionary(self) -> None:
+        if DictionaryDialog(self).exec() == DictionaryDialog.DialogCode.Accepted:
+            self._sync_numbers()
+            self._timing_changed()
+
+    def show_readings(self) -> None:
+        ReadingsDialog(self._segments(self.editor.toPlainText()), reading.reader(), self).exec()
+
+    def _sync_numbers(self) -> None:
+        self.numbers_action.blockSignals(True)
+        self.numbers_action.setChecked(reading.load().numbers)
+        self.numbers_action.blockSignals(False)
+
+    def _set_numbers(self, on: bool) -> None:
+        book = reading.load()
+        book.numbers = on
+        reading.save(book)
+        self._show_status("숫자를 한국어로 읽습니다 (14개 → 열네 개)." if on else "숫자 자동 읽기를 껐습니다 (목소리 모델이 읽는 대로).")
+        self._timing_changed()
 
     def _show_status(self, message: str) -> None:
         self.status.setText(message)

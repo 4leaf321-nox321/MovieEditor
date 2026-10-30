@@ -1,4 +1,4 @@
-"""The text box: dropped files, highlighted pause marks, and each line's length beside it."""
+"""The text box: dropped files, highlighted pause and reading marks, and each line's length beside it."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from PySide6.QtGui import QColor, QPainter, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import QPlainTextEdit, QToolTip, QWidget
 
 from .pipeline import Timeline
+from .reading import READING_MARK
 from .textproc import PAUSE_MARK
 
 GUTTER_WIDTH = 78
@@ -30,10 +31,15 @@ class PauseHighlighter(QSyntaxHighlighter):
         self.mark_format = QTextCharFormat()
         self.mark_format.setForeground(QColor("#1d4ed8"))
         self.mark_format.setBackground(QColor("#dbeafe"))
+        self.reading_format = QTextCharFormat()  # {14번|열네 번}
+        self.reading_format.setForeground(QColor("#047857"))
+        self.reading_format.setBackground(QColor("#d1fae5"))
 
     def highlightBlock(self, text):
         for m in PAUSE_MARK.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), self.mark_format)
+        for m in READING_MARK.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self.reading_format)
 
 
 class DurationGutter(QWidget):
@@ -91,6 +97,7 @@ class TextEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.context_actions = []  # put at the top of the right-click menu
         self.highlighter = PauseHighlighter(self.document())
         self.gutter = DurationGutter(self)
         self.setViewportMargins(0, 0, GUTTER_WIDTH, 0)
@@ -111,6 +118,16 @@ class TextEditor(QPlainTextEdit):
         super().resizeEvent(event)
         viewport = self.viewport().geometry()
         self.gutter.setGeometry(viewport.right() + 1, viewport.top(), GUTTER_WIDTH, viewport.height())
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu(event.pos())
+        if self.context_actions:
+            first = menu.actions()[0] if menu.actions() else None
+            for action in self.context_actions:
+                menu.insertAction(first, action)
+            menu.insertSeparator(first)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():

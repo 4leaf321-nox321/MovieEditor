@@ -28,6 +28,8 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 
+from tts_app import reading
+
 from . import canvas, graphics, media, scene_render, subs, templates
 from .media import format_time
 from .scenes import MIN_DURATION, TAIL, Project, Scene, TextBox, TextStyle
@@ -207,7 +209,7 @@ def script(board: Board) -> str:
 
 
 def _plain(text: str) -> str:
-    return re.sub(r"[\s\W_]+", "", text or "").lower()
+    return re.sub(r"[\s\W_]+", "", reading.written(text or "")).lower()
 
 
 def align(narrations: list[str], cues: list[subs.Cue]) -> tuple[list[tuple[int, int] | None], float]:
@@ -468,7 +470,7 @@ def compare(narrations: list[str], cues: list[subs.Cue]) -> list[Check]:
     out = []
     for k, (text, rng) in enumerate(zip(narrations, ranges), 1):
         spoken = " ".join(c.text for c in cues[rng[0] : rng[1]]) if rng else ""
-        written = " ".join(text.split())
+        written = " ".join(reading.written(text).split())
         a, b = _plain(written), _plain(spoken)
         ratio = 1.0 if a == b else difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
         if written or spoken:
